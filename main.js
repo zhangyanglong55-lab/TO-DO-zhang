@@ -1,0 +1,4631 @@
+const {
+  app,
+  BrowserWindow,
+  screen,
+  ipcMain,
+  Tray,
+  Menu,
+  nativeImage,
+  shell,
+  systemPreferences,
+  clipboard,
+  globalShortcut,
+  safeStorage,
+  dialog,
+  desktopCapturer,
+  ClipboardItem,
+} = require('electron');
+const WebSocket = require('ws');
+const path = require('path');
+const fs = require('fs');
+const http = require('http');
+const dns = require('dns');
+const zlib = require('zlib');
+const crypto = require('crypto');
+const { execFile } = require('child_process');
+const platformPolicy = require('./platform');
+const PLATFORM_CAPABILITIES = platformPolicy.capabilities(process.platform);
+const {
+  isPrivateAddress,
+  extractPageTitle,
+  recordingExtension,
+  finalizeSavedRecording,
+  normalizeWindowRows,
+  todoReminderState,
+  todoReminderTimerDelay,
+  taskNotificationIdentity,
+  normalizeCredentialInput,
+  parseSmartLinkMetadata,
+  extractFaviconHref,
+  parseSmartMaterialMetadata,
+  clipboardServicePolicy,
+  createClipboardImageFingerprint,
+  prepareClipboardImagePayload,
+  installLocalWebContentsGuards,
+  runOwnedOpenDialog,
+  readClipboardObservation,
+  updateFeaturePreference,
+  controlSodaMusic,
+  sodaShortcutSpec,
+  selectTranscriptionSettings,
+  createWorkspacePersistenceGate,
+  isTodoInboxCandidate,
+  parseTodoInboxBuffer,
+  todoInboxArchiveNames,
+  buildTodoInboxReport,
+  buildWorkInboxReport,
+  buildLinkInboxReport,
+  hoverSpacePollingPolicy,
+  reduceClipboardObservation,
+  normalizeDefaultTabPreference,
+  updateDefaultTabPreference,
+  createForegroundMediaPermissionCoordinator,
+} = require('./main-services');
+const {
+  parseWorkInboxPayload,
+  localDateKey,
+  isoWeekKey,
+} = require('./renderer/domain');
+const { createAgentUsageMonitor } = require('./main/agent-usage');
+const { createNotchGeometry } = require('./main/notch-geometry');
+const { createMusicPlayers, normalizeMusicPreference } = require('./main/music-players');
+const {
+  buildPermissionList,
+  missingRequiredPermissions,
+  permissionSettingsUrl,
+} = require('./main/permissions');
+
+// Keep the historical data directory so upgrading users retain notes, links,
+// recordings and encrypted settings after the public product rename.
+const LEGACY_USER_DATA_PATH = path.join(app.getPath('appData'), 'Dynamic Panel');
+app.setName('TO-DO Panel');
+// Honor Electron's standard profile switch for isolated automated tests.
+app.setPath('userData', app.commandLine.getSwitchValue('user-data-dir') || LEGACY_USER_DATA_PATH);
+
+// ============ 托盘图标 PNG 生成 ============
+// 直接在主进程编码 PNG，避免引入额外资源文件
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+
+function crc32(buf) {
+  let crc = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) {
+    crc = (crc >>> 8) ^ CRC_TABLE[(crc ^ buf[i]) & 0xff];
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function pngChunk(type, data) {
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(data.length, 0);
+  const typeBuf = Buffer.from(type, 'ascii');
+  const crcBuf = Buffer.alloc(4);
+  crcBuf.writeUInt32BE(crc32(Buffer.concat([typeBuf, data])), 0);
+  return Buffer.concat([len, typeBuf, data, crcBuf]);
+}
+
+function encodePng(width, height, pixels) {
+  const sig = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 6;
+  ihdr[10] = 0;
+  ihdr[11] = 0;
+  ihdr[12] = 0;
+  const scanlines = Buffer.alloc(height * (1 + width * 4));
+  for (let y = 0; y < height; y++) {
+    const off = y * (1 + width * 4);
+    scanlines[off] = 0;
+    pixels.copy(scanlines, off + 1, y * width * 4, (y + 1) * width * 4);
+  }
+  const idat = zlib.deflateSync(scanlines);
+  return Buffer.concat([
+    sig,
+    pngChunk('IHDR', ihdr),
+    pngChunk('IDAT', idat),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+
+// 生成刘海形状：扁平顶 + 圆角底，居中偏上
+function makeNotchPng(scale) {
+  const size = 16 * scale;
+  const pixels = Buffer.alloc(size * size * 4);
+
+  // 形状参数（pt 单位 × scale）
+  const W = 10 * scale; // 刘海宽
+  const H = 5 * scale; // 刘海高
+  const R = 2 * scale; // 下方圆角半径
+  const x0 = (size - W) / 2;
+  const y0 = 3.5 * scale; // 距顶 padding
+
+  function isInside(px, py) {
+    if (px < x0 || px > x0 + W || py < y0 || py > y0 + H) return false;
+    const bottomR = y0 + H - R;
+    if (py < bottomR) return true;
+    const leftR = x0 + R;
+    const rightR = x0 + W - R;
+    if (px >= leftR && px <= rightR) return true;
+    if (px < leftR) {
+      const dx = leftR - px;
+      const dy = py - bottomR;
+      return dx * dx + dy * dy <= R * R;
+    }
+    const dx = px - rightR;
+    const dy = py - bottomR;
+    return dx * dx + dy * dy <= R * R;
+  }
+
+  // 4×4 超采样抗锯齿
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      let count = 0;
+      for (let sy = 0; sy < 4; sy++) {
+        for (let sx = 0; sx < 4; sx++) {
+          if (isInside(x + (sx + 0.5) / 4, y + (sy + 0.5) / 4)) count++;
+        }
+      }
+      const alpha = Math.round((count / 16) * 255);
+      const idx = (y * size + x) * 4;
+      pixels[idx + 3] = alpha;
+    }
+  }
+
+  return encodePng(size, size, pixels);
+}
+
+function createNotchTrayIcon() {
+  if (process.platform === 'win32') return nativeImage.createFromPath(path.join(__dirname, 'build', 'to-do-panel-icon.png')).resize({ width: 32, height: 32 });
+  const png2x = makeNotchPng(2);
+  const icon = nativeImage.createFromBuffer(png2x, { scaleFactor: 2 });
+  icon.setTemplateImage(true);
+  return icon;
+}
+
+const COLLAPSED_WIDTH = 200;
+const COLLAPSED_MIN_HEIGHT = 38;
+// NOTCH_LIP（原 6px 唇边）已移除：折叠条高度现在恰好等于菜单栏高（≈物理刘海高），
+// 一个像素都不超出物理刘海。虽然折叠条完全在菜单栏拦截带内，
+// 但本项目窗口使用 setAlwaysOnTop(true,'screen-saver') 级别，
+// 实测菜单栏不拦截该级别窗口的点击，折叠条仍可点击展开。
+// （见项目记忆 notch-top-geometry-constraint / commit f12aea1）
+
+// 所有 Tab 共用同一展开尺寸，切换内容时不再改变原生窗口边界。
+// 原生窗口只在折叠/展开两个模式间切换，避免 Tab 切换产生明显的宽高跳变。
+const EXPANDED_WIDTH = 1240;
+const EXPANDED_PANEL_HEIGHT = 540;
+const TAB_SIZES = {
+  home: { width: EXPANDED_WIDTH, panelHeight: EXPANDED_PANEL_HEIGHT },
+  todo: { width: EXPANDED_WIDTH, panelHeight: EXPANDED_PANEL_HEIGHT },
+  notes: { width: EXPANDED_WIDTH, panelHeight: EXPANDED_PANEL_HEIGHT },
+  clip: { width: EXPANDED_WIDTH, panelHeight: EXPANDED_PANEL_HEIGHT },
+  links: { width: EXPANDED_WIDTH, panelHeight: EXPANDED_PANEL_HEIGHT },
+  recordings: { width: EXPANDED_WIDTH, panelHeight: EXPANDED_PANEL_HEIGHT },
+  credentials: { width: EXPANDED_WIDTH, panelHeight: EXPANDED_PANEL_HEIGHT },
+  settings: { width: EXPANDED_WIDTH, panelHeight: EXPANDED_PANEL_HEIGHT },
+};
+// 与渲染层结构常量对应：panel padding-top(--s-2 8) + 顶栏(--topbar-h 40)
+// + panels margin-top(--s-3 12) + panel padding-bottom(--s-4 16)。内容顶到屏幕最上沿，不留菜单栏带。
+const EXPANDED_CHROME_Y = 76;
+const SCREEN_MARGIN = 24; // 宽度超屏时两侧保留的安全边
+const COLLAPSE_WATCHDOG_MS = 650;
+
+const CLIP_MAX_ITEMS = 100;
+const CLIP_POLL_INTERVAL_MS = 500;
+// 大图从系统 ClipboardItem 复制到进程仍有固定成本；图片探测降到 3 秒一次，
+// 文本继续保持 500ms 响应，不影响日常文字剪贴体验。
+const CLIP_IMAGE_POLL_INTERVAL_MS = 3000;
+const CLIP_IMAGES_DIR_NAME = 'clipboard-images';
+
+const RECORDINGS_DIR_NAME = 'recordings';
+const TRANSCRIPTION_SETTINGS_FILE = 'transcription-settings.json';
+const CREDENTIALS_VAULT_FILE = 'credentials.vault.json';
+const APP_SETTINGS_FILE = 'app-settings.json';
+const WORKSPACE_SETTINGS_FILE = 'workspace-settings.json';
+const WORKSPACE_DATA_FILE = 'workspace.json';
+const MIRROR_IMAGE_FILE = 'mirror-cover.jpg';
+// 外部脚本 / AI 助手往工作区 todo-inbox/ 放 *.json 追加待办，处理后移入 processed/。
+const TODO_INBOX_DIR_NAME = 'todo-inbox';
+const TODO_INBOX_PROCESSED_DIR_NAME = 'processed';
+const TODO_INBOX_POLL_MS = 2000;
+const TODO_INBOX_SETTLE_MS = 1000; // 文件最后修改后静置这么久才读，避开写到一半
+const TODO_INBOX_MAX_BYTES = 1024 * 1024;
+const TODO_INBOX_ACK_TIMEOUT_MS = 30000;
+const TODO_INBOX_RETRY_MS = 60000;
+// 本机约定文件夹：任意能在这台电脑上写文件的 AI 或脚本都可投放 JSON，
+// 不限于某一个助手。面板会自动读取、分类并显示，无需重启。
+const WORK_INBOX_DIR_NAME = 'work-inbox';
+const LINK_INBOX_DIR_NAME = 'link-inbox';
+const WORK_REPORTS_DIR_NAME = 'work-reports';
+const workspacePersistenceGate = createWorkspacePersistenceGate();
+const TRANSCRIPTION_MODEL = 'qwen3-asr-flash-realtime';
+const TRANSCRIPTION_SAMPLE_RATE = 16000;
+const TRANSCRIPTION_FINISH_TIMEOUT_MS = 7000;
+const RECORDING_MAX_BYTES = 1024 * 1024 * 1024;
+const LINK_FETCH_TIMEOUT_MS = 8000;
+const LINK_FETCH_MAX_BYTES = 512 * 1024;
+const LINK_FETCH_MAX_REDIRECTS = 3;
+
+// 灵动岛：常驻窗口，三种形态共用一个窗口。
+//   live  = 物理刘海 + 左右「耳朵」，高度等于菜单栏，显示各 AI 工具的上下文占用
+//   peek  = 悬停后从刘海向下长出的用量明细
+//   alert = 任务完成 / 待办到期提醒，同样从刘海向下长出
+const ISLAND_EAR_WIDTH = 62;
+const ISLAND_CANVAS_WIDTH = 380;
+const ISLAND_ALERT_BODY_HEIGHT = 64;
+const ISLAND_PEEK_MAX_HEIGHT = 300;
+const ISLAND_SCREEN_MARGIN = 12;
+// 监控轮询与 Stop 钩子可能为同一次完成各报一次，跨通道在这个窗口内只保留先到的那条。
+const TASK_NOTIFICATION_CROSS_CHANNEL_MS = 8000;
+const TASK_NOTIFICATION_VISIBLE_MS = 6000;
+const TASK_NOTIFICATION_LEAVE_MS = 360;
+const TASK_NOTIFICATION_DEDUPE_MS = 2000;
+const TASK_NOTIFICATION_MAX_QUEUE = 5;
+const TASK_NOTIFICATION_BODY_LIMIT = 64 * 1024;
+const TASK_NOTIFICATION_HOST = '127.0.0.1';
+const TASK_NOTIFICATION_PORT = 43821;
+// /notify/<source> 的来源白名单：只放行已知 Agent，其余一律 404。
+const TASK_NOTIFICATION_SOURCES = new Set(['codex', 'gpt', 'claude']);
+const TODO_REMINDER_LEAD_MS = 60 * 60 * 1000;
+
+let mainWindow = null;
+let tray = null;
+let currentMode = 'collapsed';
+// 折叠条必须待在 screen-saver 层才能点进菜单栏拦截带；该层会盖住系统输入法候选窗。
+// 输入框聚焦或正在组合时临时降到 status（高于菜单栏、低于常见 IME 候选窗）。
+const PANEL_TOP_LEVEL = 'screen-saver';
+const PANEL_IME_TOP_LEVEL = 'status';
+let panelTextInputActive = false;
+let panelImeComposing = false;
+let panelImeBlurGuard = false;
+
+let currentTab = 'home';
+let collapseWatchdog = null;
+let collapseGeneration = 0;
+let hideWhenCollapsed = false;
+let isQuitting = false;
+let mediaPermissionRequests = 0;
+let mediaPermissionBatchHadCamera = false;
+let transientSystemInteractionRequests = 0;
+let cameraBlurDeferred = false;
+const mediaPermissionCoordinator = createForegroundMediaPermissionCoordinator();
+
+let islandWindow = null;
+let islandWindowReady = false;
+let islandPeekHeight = 0;
+let islandMode = 'hidden';
+let islandHotRect = null; // 岛实际占据的屏幕区域，供悬停 + 空格判断
+let islandAlertDisplay = null; // 提醒出现时锁定的屏幕，避免中途跟着光标跳屏
+let agentMonitorEnabled = false;
+let usageSnapshot = { codex: null, claude: null, updatedAt: 0 };
+const lastTaskNotificationByChannel = new Map(); // `${source}:${channel}` -> 时间戳
+let notificationServer = null;
+let notificationServerAvailable = false;
+let activeTaskNotification = null;
+let taskNotificationLeaving = false;
+let taskNotificationTimer = null;
+let taskNotificationFallbackTimer = null;
+let taskNotificationTimerStartedAt = 0;
+let taskNotificationRemainingMs = TASK_NOTIFICATION_VISIBLE_MS;
+let taskNotificationPaused = false;
+const taskNotificationQueue = [];
+const recentTaskNotifications = new Map();
+const taskCompletionHistory = [];
+let todoReminderTimer = null;
+let scheduledTodoReminders = [];
+let todoInboxTimer = null;
+let todoInboxRendererReady = false;
+const todoInboxInFlight = new Map(); // token -> 已发给渲染层、尚未确认的文件
+const todoInboxUnarchived = new Map(); // filePath -> 已导入但移动失败，待重试归档
+const todoInboxRetryAt = new Map(); // filePath -> 渲染层要求稍后重试的时间点
+
+let clipPollTimer = null;
+let clipBaselineTimer = null;
+let clipPollingEnabled = false;
+let clipPolling = false; // 互斥锁：大图 toPNG 同步耗时，防止上一轮未完成又进入
+let clipObservationState = { textFingerprint: null, imageFingerprint: null };
+let lastClipImageProbeAt = 0;
+let clipPollingGeneration = 0;
+let spaceShortcutTimer = null;
+let spaceShortcutRegistered = false;
+let configuredShortcut = '';
+let previousPasteTarget = null;
+let clipFeatureEnabled = false;
+let windowScanCache = new Map();
+const windowIconCache = new Map();
+const transcriptionSessions = new Map();
+
+const gotTheLock = app.requestSingleInstanceLock();
+
+if (!gotTheLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (mainWindow) {
+      hideWhenCollapsed = false;
+      repositionWindow(getTargetDisplay());
+      if (!mainWindow.isVisible()) mainWindow.show();
+      mainWindow.focus();
+    }
+  });
+}
+
+// 多屏适配：定位到"鼠标当前所在屏"的物理顶端居中
+// 这样接上外接屏后，无论副屏在主屏的左/右/上/下，刘海都跟着用户视线走
+function getTargetDisplay() {
+  try {
+    const cursor = screen.getCursorScreenPoint();
+    return screen.getDisplayNearestPoint(cursor);
+  } catch (e) {
+    return screen.getPrimaryDisplay();
+  }
+}
+
+// 窗口当前所在屏：模式切换 / Tab 变形必须锚定在这块屏上。
+// 若跟随光标（getTargetDisplay），失焦收起瞬间会把刘海"瞬移"到光标所在的另一块屏。
+function getWindowDisplay() {
+  try {
+    if (mainWindow) return screen.getDisplayMatching(mainWindow.getBounds());
+  } catch (e) {
+    // fallthrough
+  }
+  return getTargetDisplay();
+}
+
+function getCenteredBounds(width, height, display) {
+  const d = display || getTargetDisplay();
+  const area = process.platform === 'win32' ? d.workArea : d.bounds;
+  return {
+    x: Math.round(area.x + (area.width - width) / 2),
+    y: area.y,
+    width,
+    height,
+  };
+}
+
+// macOS 菜单栏会拦截其高度带内的所有鼠标点击（即使窗口绘制在其上方），
+// 刘海屏机型菜单栏高约 37pt，等于物理刘海高度。
+function getMenuBarHeight(display) {
+  return Math.max(0, display.workArea.y - display.bounds.y);
+}
+
+function getCollapsedHeight(display) {
+  if (process.platform === 'win32') return COLLAPSED_MIN_HEIGHT;
+  const mb = getMenuBarHeight(display);
+  // 折叠条高度恰好等于菜单栏带（≈物理刘海高），一个像素都不超出物理刘海。
+  // 无刘海的外接屏 menuBarHeight 仍是真实菜单栏高，能正常露头；
+  // 异常取到 0 才回退兜底（COLLAPSED_MIN_HEIGHT = 38px）。
+  return mb > 0 ? mb : COLLAPSED_MIN_HEIGHT;
+}
+
+// 展开尺寸按当前 Tab 取值；宽度超出屏幕时 clamp 到工作区内。
+// 窗口从屏幕最顶垂下（y=0），内容直接顶到最上沿，高度不含菜单栏带。
+function getExpandedSize(display) {
+  const size = TAB_SIZES[currentTab] || TAB_SIZES.home;
+  return {
+    width: Math.min(size.width, display.workArea.width - SCREEN_MARGIN),
+    height: Math.min(
+      EXPANDED_CHROME_Y + size.panelHeight,
+      Math.max(getCollapsedHeight(display), display.bounds.height - SCREEN_MARGIN)
+    ),
+  };
+}
+
+// display 不传时锚定窗口当前所在屏；只有"召唤"类动作（启动/重新居中/显示）才传光标屏。
+// 一律瞬时 setBounds：系统动画 resize 会持续重绘 web 内容（卡顿）。
+// 原生窗口只提供透明画布，用户可见的岛体形变交给渲染层 CSS。
+function getBoundsForMode(mode, display) {
+  const d = display || getWindowDisplay();
+  if (process.platform === 'win32') return platformPolicy.panelBounds(process.platform, d, mode === 'expanded');
+  if (mode === 'expanded') {
+    const { width, height } = getExpandedSize(d);
+    return getCenteredBounds(width, height, d);
+  }
+  return getCenteredBounds(COLLAPSED_WIDTH, getCollapsedHeight(d), d);
+}
+
+function cancelCollapseWatchdog() {
+  collapseGeneration++;
+  if (collapseWatchdog) {
+    clearTimeout(collapseWatchdog);
+    collapseWatchdog = null;
+  }
+}
+
+function panelNeedsImeSafeLevel() {
+  return process.platform === 'darwin'
+    && currentMode === 'expanded'
+    && (panelTextInputActive || panelImeComposing);
+}
+
+function applyPanelWindowLevel() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.setAlwaysOnTop(true, panelNeedsImeSafeLevel() ? PANEL_IME_TOP_LEVEL : PANEL_TOP_LEVEL);
+}
+
+function setPanelImeBlurGuard(enabled) {
+  if (enabled === panelImeBlurGuard) return;
+  panelImeBlurGuard = enabled;
+  if (enabled) {
+    transientSystemInteractionRequests += 1;
+    return;
+  }
+  transientSystemInteractionRequests = Math.max(0, transientSystemInteractionRequests - 1);
+  if (transientSystemInteractionRequests === 0 && mediaPermissionRequests === 0) {
+    const shouldCollapse = cameraBlurDeferred;
+    cameraBlurDeferred = false;
+    if (shouldCollapse && currentMode === 'expanded') requestRendererCollapse();
+  }
+}
+
+function updatePanelImeState(payload = {}) {
+  if (typeof payload.inputActive === 'boolean') panelTextInputActive = payload.inputActive;
+  if (typeof payload.composing === 'boolean') panelImeComposing = payload.composing;
+  if (currentMode !== 'expanded') {
+    panelTextInputActive = false;
+    panelImeComposing = false;
+  }
+  setPanelImeBlurGuard(panelImeComposing);
+  applyPanelWindowLevel();
+}
+
+function applyMode(mode, display) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  cancelCollapseWatchdog();
+  mainWindow.setBounds(getBoundsForMode(mode, display));
+  mainWindow.setIgnoreMouseEvents(false);
+  currentMode = mode;
+  if (mode === 'expanded') hideWhenCollapsed = false;
+  if (mode !== 'expanded') updatePanelImeState({ inputActive: false, composing: false });
+  else applyPanelWindowLevel();
+  if (mode === 'collapsed' && hideWhenCollapsed) {
+    hideWhenCollapsed = false;
+    mainWindow.hide();
+    refreshTrayMenu();
+  }
+  syncHoverSpacePolling();
+  syncIsland();
+}
+
+// 纯重新定位不能改变收起事务，否则屏幕变化会取消 watchdog 并重新吞掉鼠标。
+function repositionWindow(display) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.setBounds(getBoundsForMode(currentMode, display));
+}
+
+function beginNativeCollapse() {
+  if (!mainWindow || currentMode !== 'expanded') return;
+  const targetWindow = mainWindow;
+  const generation = ++collapseGeneration;
+  targetWindow.setIgnoreMouseEvents(true);
+  if (collapseWatchdog) clearTimeout(collapseWatchdog);
+  collapseWatchdog = setTimeout(() => {
+    if (generation !== collapseGeneration) return;
+    collapseWatchdog = null;
+    if (mainWindow === targetWindow && currentMode === 'expanded') {
+      applyMode('collapsed');
+    }
+  }, COLLAPSE_WATCHDOG_MS);
+}
+
+function requestRendererCollapse() {
+  if (!mainWindow || currentMode !== 'expanded') return;
+  beginNativeCollapse();
+  mainWindow.webContents.send('window:request-collapse');
+}
+
+function hideWindowAfterCollapse() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (currentMode === 'expanded') {
+    hideWhenCollapsed = true;
+    requestRendererCollapse();
+    return;
+  }
+  hideWhenCollapsed = false;
+  mainWindow.hide();
+  refreshTrayMenu();
+}
+
+// ============ Codex / Claude / GPT 任务完成提醒 ============
+// 使用独立的非激活窗口，避免打断主刘海窗口的展开、收起和焦点状态机。
+
+function pickTaskNotificationValue(payload, keys) {
+  for (const key of keys) {
+    const value = payload[key];
+    if ((typeof value === 'string' || typeof value === 'number') && String(value).trim()) {
+      return String(value);
+    }
+  }
+  return '';
+}
+
+function cleanTaskNotificationText(value, maxLength) {
+  if (typeof value !== 'string' && typeof value !== 'number') return '';
+  const firstLine = String(value)
+    .replace(/[\u202a-\u202e\u2066-\u2069]/g, '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean);
+  if (!firstLine) return '';
+  const cleaned = firstLine
+    .replace(/^[#>*`_~\-\s]+/, '')
+    .replace(/[`*_~]/g, '')
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const characters = Array.from(cleaned);
+  return characters.length > maxLength ? characters.slice(0, maxLength).join('') : cleaned;
+}
+
+function isSubagentNotification(payload) {
+  const agentType = pickTaskNotificationValue(payload, [
+    'agent_type',
+    'agent-type',
+    'agentType',
+  ]).toLowerCase();
+  const hookEvent = pickTaskNotificationValue(payload, [
+    'hook_event_name',
+    'hook-event-name',
+    'hookEventName',
+  ]).toLowerCase();
+  // Claude Code 的 agent_type 存的是子代理名（Explore / security-reviewer 等），
+  // 不含 subagent 字样，只有身处子代理时才带 agent_id，故以该字段存在为准。
+  const agentId = pickTaskNotificationValue(payload, ['agent_id', 'agent-id', 'agentId']);
+  return Boolean(agentId)
+    || hookEvent.includes('subagent')
+    || agentType.includes('subagent')
+    || payload.is_subagent === true
+    || payload.isSubagent === true;
+}
+
+function normalizeTaskNotification(payload, source) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
+  if (isSubagentNotification(payload)) return null;
+  const identity = taskNotificationIdentity(payload, source);
+
+  const taskId = cleanTaskNotificationText(
+    pickTaskNotificationValue(payload, [
+      'turn_id',
+      'turn-id',
+      'turnId',
+      'thread_id',
+      'thread-id',
+      'threadId',
+      'session_id',
+      'session-id',
+      'sessionId',
+      'task_id',
+      'task-id',
+      'taskId',
+      'id',
+    ]),
+    160
+  );
+
+  const completedAtValue = Number(
+    pickTaskNotificationValue(payload, ['completed_at', 'completed-at', 'completedAt'])
+  );
+  const completedAt = Number.isFinite(completedAtValue) && completedAtValue > 0
+    ? completedAtValue
+    : Date.now();
+
+  return {
+    eventId: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
+    source,
+    taskId,
+    title: identity.title,
+    project: identity.project,
+    completedAt,
+  };
+}
+
+function getPendingTaskNotificationCount() {
+  return taskNotificationQueue.reduce(
+    (total, item) => total + (item.summaryCount || 1),
+    0
+  );
+}
+
+function sendTaskNotificationQueueCount() {
+  if (
+    !islandWindow ||
+    islandWindow.isDestroyed() ||
+    !islandWindowReady ||
+    !activeTaskNotification
+  ) {
+    return;
+  }
+  islandWindow.webContents.send(
+    'task-notification:queue',
+    getPendingTaskNotificationCount()
+  );
+}
+
+function enqueueTaskNotification(notification) {
+  if (!notification) return 'ignored';
+  const now = Date.now();
+  for (const [key, seenAt] of recentTaskNotifications) {
+    if (now - seenAt > TASK_NOTIFICATION_DEDUPE_MS) recentTaskNotifications.delete(key);
+  }
+
+  const channel = notification.channel === 'monitor' ? 'monitor' : 'hook';
+  const otherChannel = channel === 'monitor' ? 'hook' : 'monitor';
+  const otherSeenAt = lastTaskNotificationByChannel.get(`${notification.source}:${otherChannel}`);
+  if (otherSeenAt && now - otherSeenAt <= TASK_NOTIFICATION_CROSS_CHANNEL_MS) return 'duplicate';
+  lastTaskNotificationByChannel.set(`${notification.source}:${channel}`, now);
+
+  const identity = notification.taskId || `${notification.title}:${notification.project}`;
+  const dedupeKey = `${notification.source}:${identity}`;
+  const lastSeenAt = recentTaskNotifications.get(dedupeKey);
+  if (lastSeenAt && now - lastSeenAt <= TASK_NOTIFICATION_DEDUPE_MS) return 'duplicate';
+  recentTaskNotifications.set(dedupeKey, now);
+
+  if (notification.source !== 'todo') {
+    taskCompletionHistory.unshift(notification);
+    if (taskCompletionHistory.length > 20) taskCompletionHistory.length = 20;
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('task-completion:new', notification);
+    }
+  }
+
+  if (taskNotificationQueue.length < TASK_NOTIFICATION_MAX_QUEUE) {
+    taskNotificationQueue.push(notification);
+  } else {
+    const lastIndex = taskNotificationQueue.length - 1;
+    const previous = taskNotificationQueue[lastIndex];
+    const summaryCount = previous.isSummary ? previous.summaryCount + 1 : 2;
+    taskNotificationQueue[lastIndex] = {
+      ...notification,
+      source: 'task',
+      taskId: '',
+      title: `另有 ${summaryCount} 个任务已完成`,
+      project: '',
+      isSummary: true,
+      summaryCount,
+    };
+  }
+
+  if (activeTaskNotification) {
+    sendTaskNotificationQueueCount();
+  } else {
+    showNextTaskNotification();
+  }
+  return 'queued';
+}
+
+function clearTodoReminderTimer() {
+  if (todoReminderTimer) clearTimeout(todoReminderTimer);
+  todoReminderTimer = null;
+}
+
+function fireTodoReminder(todo) {
+  const deadline = Date.parse(String(todo.deadline || ''));
+  const notification = {
+    eventId: `todo-${todo.id}-${deadline}`,
+    source: 'todo',
+    taskId: String(todo.id || ''),
+    title: String(todo.text || '').trim() || '待办即将截止',
+    project: '',
+    detail: '将在 1 小时内截止',
+    deadline,
+    completedAt: Date.now(),
+  };
+  enqueueTaskNotification(notification);
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('todo:reminded', {
+      id: notification.taskId,
+      deadline: String(todo.deadline || ''),
+      remindedAt: notification.completedAt,
+    });
+  }
+}
+
+function scheduleNextTodoReminder() {
+  clearTodoReminderTimer();
+  const now = Date.now();
+  let nextDelay = Infinity;
+  for (const todo of scheduledTodoReminders) {
+    const status = todoReminderState(todo, now, TODO_REMINDER_LEAD_MS);
+    if (status.state === 'due') {
+      todo.remindedAt = now;
+      fireTodoReminder(todo);
+      continue;
+    }
+    if (status.state === 'scheduled') nextDelay = Math.min(nextDelay, status.delayMs);
+  }
+  if (Number.isFinite(nextDelay)) {
+    todoReminderTimer = setTimeout(scheduleNextTodoReminder, todoReminderTimerDelay(nextDelay));
+  }
+}
+
+ipcMain.handle('todos:schedule-reminders', (event, items) => {
+  scheduledTodoReminders = Array.isArray(items)
+    ? items
+      .filter((item) => item && typeof item === 'object')
+      .map((item) => ({
+        id: String(item.id || '').slice(0, 160),
+        text: String(item.text || '').trim().slice(0, 160),
+        deadline: String(item.deadline || ''),
+        done: item.done === true,
+        remindedAt: Math.max(0, Number(item.remindedAt) || 0),
+      }))
+      .filter((item) => item.id && item.text)
+    : [];
+  scheduleNextTodoReminder();
+  return { ok: true, count: scheduledTodoReminders.length };
+});
+
+ipcMain.handle('pomodoro:notify', (event, minutes) => {
+  const safeMinutes = Math.max(1, Math.min(120, Math.round(Number(minutes) || 25)));
+  const completedAt = Date.now();
+  const notification = {
+    eventId: `pomodoro-${completedAt}`,
+    taskId: `pomodoro-${completedAt}`,
+    source: 'pomodoro',
+    project: '番茄钟',
+    title: '专注完成',
+    body: `${safeMinutes} 分钟专注计时已结束`,
+    completedAt,
+  };
+  return { ok: true, result: enqueueTaskNotification(notification) };
+});
+
+function islandTools() {
+  // 耳朵是贴着物理刘海 / 菜单栏画的，Windows 上没有对应的位置；那里只保留完成提醒。
+  if (!agentMonitorEnabled || process.platform !== 'darwin') return [];
+  // 固定顺序：Claude 在左、Codex 在右。位置不随活跃度互换，用户才能凭位置认工具。
+  return ['claude', 'codex'].map((key) => usageSnapshot[key]).filter(Boolean);
+}
+
+function islandLiveVisible() {
+  return islandTools().length > 0
+    && currentMode !== 'expanded'
+    && Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible());
+}
+
+// 岛的形态完全由状态推导：有提醒 → alert；悬停明细 → peek；有会话 → live；否则隐藏。
+function getIslandLayout() {
+  const alert = Boolean(activeTaskNotification);
+  const live = islandLiveVisible();
+  const peek = live && !alert && islandPeekHeight > 0;
+  const display = alert ? (islandAlertDisplay || getTargetDisplay()) : getWindowDisplay();
+  const area = process.platform === 'win32' ? display.workArea : display.bounds;
+  const menuBarHeight = getCollapsedHeight(display);
+  const coreWidth = notchGeometry.coreWidth(display);
+  const tools = live ? islandTools() : [];
+  const leftEar = tools.length > 0 ? ISLAND_EAR_WIDTH : 0;
+  const rightEar = tools.length > 1 ? ISLAND_EAR_WIDTH : 0;
+  const screenCenter = area.x + area.width / 2;
+
+  // 窗口的横向位置与宽度在三种形态之间保持不变，只改高度。
+  // 此前 live 形态的窗口刚好包住耳朵、展开时再换成更宽的窗口：窗口换位置和页面换布局
+  // 不在同一帧生效，中间那一两帧旧画面被贴到新位置上，耳朵图标就在旁边闪出一个重影。
+  // 现在 live 形态两侧多出来的透明区域靠 setIgnoreMouseEvents 放行点击（见 island:interactive）。
+  const width = Math.min(ISLAND_CANVAS_WIDTH, Math.max(280, area.width - ISLAND_SCREEN_MARGIN * 2));
+  const x = Math.round(screenCenter - width / 2);
+  let mode = 'hidden';
+  let height = 0;
+  if (alert || peek) {
+    mode = alert ? 'alert' : 'peek';
+    height = menuBarHeight + (alert ? ISLAND_ALERT_BODY_HEIGHT : islandPeekHeight);
+  } else if (live) {
+    mode = 'live';
+    height = menuBarHeight;
+  }
+  // 真正「是岛」的那一块（屏幕坐标）：live 形态下只有刘海 + 耳朵，展开后是整个窗口。
+  const hotRect = mode === 'live'
+    ? { x: screenCenter - coreWidth / 2 - leftEar, y: area.y, width: leftEar + coreWidth + rightEar, height }
+    : { x, y: area.y, width, height };
+  return {
+    mode,
+    bounds: { x, y: area.y, width: Math.round(width), height: Math.round(height) },
+    hotRect,
+    metrics: {
+      mode,
+      // 刘海中心在窗口内的横坐标：窗口左右不对称（只有一只耳朵）时内容仍以刘海为轴。
+      centerX: screenCenter - x,
+      coreWidth,
+      menuBarHeight,
+      earWidth: ISLAND_EAR_WIDTH,
+      leftEar: leftEar > 0,
+      rightEar: rightEar > 0,
+      hasNotch: notchGeometry.hasNotch(display),
+    },
+  };
+}
+
+function syncIsland() {
+  const layout = getIslandLayout();
+  if (layout.mode === 'hidden') {
+    islandPeekHeight = 0;
+    islandMode = 'hidden';
+    islandHotRect = null;
+    syncIslandHoverPolling();
+    if (islandWindow && !islandWindow.isDestroyed()) {
+      if (islandWindowReady) islandWindow.webContents.send('island:layout', layout.metrics);
+      if (islandWindow.isVisible()) islandWindow.hide();
+    }
+    return;
+  }
+  const targetWindow = createIslandWindow();
+  if (!islandWindowReady || !targetWindow || targetWindow.isDestroyed()) return;
+  targetWindow.setBounds(layout.bounds);
+  islandHotRect = layout.hotRect;
+  if (layout.mode !== islandMode) {
+    islandMode = layout.mode;
+    // live：默认整窗放行点击（两侧透明区下面是菜单栏），光标移到耳朵 / 刘海上才接管（见 pollIslandHover）。
+    // 展开后整窗都是岛，直接接管。
+    if (layout.mode === 'live' && !islandHovering) targetWindow.setIgnoreMouseEvents(true, { forward: true });
+    else targetWindow.setIgnoreMouseEvents(false);
+  }
+  syncIslandHoverPolling();
+  targetWindow.webContents.send('island:layout', layout.metrics);
+  if (!targetWindow.isVisible()) targetWindow.showInactive();
+}
+
+// 悬停判断由主进程按光标位置轮询，而不是靠页面里的鼠标事件：
+// live 形态的窗口默认放行点击，放行状态下页面收不收得到鼠标事件取决于系统转发，不能依赖。
+// 光标进入「刘海 + 耳朵」→ 窗口接管鼠标并通知页面；离开 → 放行并通知页面。
+const ISLAND_HOVER_POLL_MS = 60;
+let islandHoverTimer = null;
+let islandHovering = false;
+
+function setIslandHovering(hovering) {
+  if (hovering === islandHovering) return;
+  islandHovering = hovering;
+  if (!islandWindow || islandWindow.isDestroyed()) return;
+  if (islandMode === 'live') {
+    if (hovering) islandWindow.setIgnoreMouseEvents(false);
+    else islandWindow.setIgnoreMouseEvents(true, { forward: true });
+  }
+  if (islandWindowReady) islandWindow.webContents.send('island:hover', hovering);
+}
+
+function pollIslandHover() {
+  if (!islandHotRect || !islandWindow || islandWindow.isDestroyed() || !islandWindow.isVisible()) {
+    setIslandHovering(false);
+    return;
+  }
+  const point = screen.getCursorScreenPoint();
+  const rect = islandHotRect;
+  setIslandHovering(
+    point.x >= rect.x && point.x < rect.x + rect.width
+    && point.y >= rect.y && point.y < rect.y + rect.height
+  );
+}
+
+function syncIslandHoverPolling() {
+  const needed = islandMode === 'live' || islandMode === 'peek';
+  if (needed && !islandHoverTimer) {
+    islandHoverTimer = setInterval(pollIslandHover, ISLAND_HOVER_POLL_MS);
+  } else if (!needed && islandHoverTimer) {
+    clearInterval(islandHoverTimer);
+    islandHoverTimer = null;
+    setIslandHovering(false);
+  }
+}
+
+function sendIslandUsage() {
+  if (!islandWindow || islandWindow.isDestroyed() || !islandWindowReady) return;
+  islandWindow.webContents.send('island:usage', {
+    tools: islandTools(),
+    updatedAt: usageSnapshot.updatedAt,
+  });
+}
+
+function recoverClosedTaskNotificationWindow(targetWindow) {
+  if (islandWindow !== targetWindow) return;
+  const interruptedNotification = activeTaskNotification;
+  clearTaskNotificationTimers();
+  islandWindow = null;
+  islandWindowReady = false;
+  islandMode = 'hidden';
+  islandHotRect = null;
+  activeTaskNotification = null;
+  taskNotificationLeaving = false;
+  taskNotificationPaused = false;
+  taskNotificationRemainingMs = TASK_NOTIFICATION_VISIBLE_MS;
+  if (!isQuitting && interruptedNotification) {
+    taskNotificationQueue.unshift(interruptedNotification);
+  }
+  islandPeekHeight = 0;
+  if (!isQuitting) {
+    setTimeout(() => {
+      showNextTaskNotification();
+      syncIsland();
+    }, 80);
+  }
+}
+
+function createIslandWindow() {
+  if (islandWindow && !islandWindow.isDestroyed()) return islandWindow;
+  const bounds = getCenteredBounds(ISLAND_CANVAS_WIDTH, getCollapsedHeight(getTargetDisplay()));
+  islandWindowReady = false;
+  islandWindow = new BrowserWindow({
+    ...bounds,
+    frame: false,
+    transparent: true,
+    backgroundColor: '#00000000',
+    resizable: false,
+    movable: false,
+    focusable: false,
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    hasShadow: false,
+    hiddenInMissionControl: true,
+    fullscreenable: false,
+    minimizable: false,
+    maximizable: false,
+    roundedCorners: false,
+    show: false,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload-island.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      backgroundThrottling: false,
+    },
+  });
+
+  installLocalWebContentsGuards(islandWindow.webContents);
+
+  const targetWindow = islandWindow;
+  islandWindow.setAlwaysOnTop(true, 'screen-saver', 1);
+  if (process.platform === 'darwin') islandWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  islandWindow.setIgnoreMouseEvents(false);
+  islandWindow.loadFile(path.join(__dirname, 'renderer', 'island.html'));
+
+  targetWindow.webContents.once('did-finish-load', () => {
+    if (islandWindow !== targetWindow || targetWindow.isDestroyed()) return;
+    islandWindowReady = true;
+    sendIslandUsage();
+    showNextTaskNotification();
+    syncIsland();
+  });
+
+  targetWindow.webContents.on('render-process-gone', () => {
+    if (!targetWindow.isDestroyed()) targetWindow.destroy();
+  });
+  targetWindow.on('closed', () => {
+    recoverClosedTaskNotificationWindow(targetWindow);
+  });
+  return islandWindow;
+}
+
+function clearTaskNotificationTimers() {
+  if (taskNotificationTimer) {
+    clearTimeout(taskNotificationTimer);
+    taskNotificationTimer = null;
+  }
+  if (taskNotificationFallbackTimer) {
+    clearTimeout(taskNotificationFallbackTimer);
+    taskNotificationFallbackTimer = null;
+  }
+}
+
+function scheduleTaskNotificationDismiss() {
+  if (!activeTaskNotification || taskNotificationLeaving || taskNotificationPaused) return;
+  if (taskNotificationTimer) clearTimeout(taskNotificationTimer);
+  taskNotificationTimerStartedAt = Date.now();
+  taskNotificationTimer = setTimeout(
+    beginTaskNotificationDismiss,
+    Math.max(0, taskNotificationRemainingMs)
+  );
+}
+
+function setTaskNotificationPaused(paused) {
+  if (!activeTaskNotification || taskNotificationLeaving || taskNotificationPaused === paused) return;
+  taskNotificationPaused = paused;
+  if (paused) {
+    if (taskNotificationTimer) {
+      taskNotificationRemainingMs = Math.max(
+        0,
+        taskNotificationRemainingMs - (Date.now() - taskNotificationTimerStartedAt)
+      );
+      clearTimeout(taskNotificationTimer);
+      taskNotificationTimer = null;
+    }
+  } else {
+    scheduleTaskNotificationDismiss();
+  }
+}
+
+function showNextTaskNotification() {
+  if (activeTaskNotification || taskNotificationQueue.length === 0 || isQuitting) return;
+  const targetWindow = createIslandWindow();
+  if (!islandWindowReady || !targetWindow || targetWindow.isDestroyed()) return;
+
+  activeTaskNotification = taskNotificationQueue.shift();
+  islandAlertDisplay = getTargetDisplay();
+  islandPeekHeight = 0;
+  taskNotificationLeaving = false;
+  taskNotificationPaused = false;
+  taskNotificationRemainingMs = TASK_NOTIFICATION_VISIBLE_MS;
+  syncIsland();
+  targetWindow.webContents.send('task-notification:show', {
+    ...activeTaskNotification,
+    pendingCount: getPendingTaskNotificationCount(),
+    visibleMs: TASK_NOTIFICATION_VISIBLE_MS,
+  });
+  scheduleTaskNotificationDismiss();
+}
+
+function beginTaskNotificationDismiss() {
+  if (!activeTaskNotification || taskNotificationLeaving) return;
+  taskNotificationLeaving = true;
+  clearTaskNotificationTimers();
+  const eventId = activeTaskNotification.eventId;
+  if (islandWindow && !islandWindow.isDestroyed() && islandWindowReady) {
+    islandWindow.webContents.send('task-notification:hide', eventId);
+  }
+  taskNotificationFallbackTimer = setTimeout(
+    () => finishTaskNotification(eventId),
+    TASK_NOTIFICATION_LEAVE_MS + 120
+  );
+}
+
+function finishTaskNotification(eventId) {
+  if (!activeTaskNotification || activeTaskNotification.eventId !== eventId) return;
+  clearTaskNotificationTimers();
+  activeTaskNotification = null;
+  islandAlertDisplay = null;
+  taskNotificationLeaving = false;
+  taskNotificationPaused = false;
+  taskNotificationRemainingMs = TASK_NOTIFICATION_VISIBLE_MS;
+  // 窗口常驻、不再销毁：下一条提醒不必等页面冷启动，没有提醒时退回 live 形态或隐藏。
+  setTimeout(() => {
+    showNextTaskNotification();
+    if (!activeTaskNotification) syncIsland();
+  }, 80);
+}
+
+function sendTaskNotificationResponse(response, statusCode, body) {
+  if (response.headersSent) return;
+  const json = JSON.stringify(body);
+  response.writeHead(statusCode, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': Buffer.byteLength(json),
+    'Cache-Control': 'no-store',
+  });
+  response.end(json);
+}
+
+function startTaskNotificationServer() {
+  if (notificationServer) return;
+  const server = http.createServer((request, response) => {
+    let requestUrl;
+    try {
+      requestUrl = new URL(request.url || '/', `http://${TASK_NOTIFICATION_HOST}`);
+    } catch (error) {
+      sendTaskNotificationResponse(response, 400, { ok: false, error: 'invalid_url' });
+      return;
+    }
+    if (request.method === 'GET' && requestUrl.pathname === '/health') {
+      sendTaskNotificationResponse(response, 200, { ok: true });
+      return;
+    }
+
+    // /usage/claude：Claude Code 状态栏脚本上报的额度（会话记录里没有这项数据）。
+    const isClaudeUsage = requestUrl.pathname === '/usage/claude';
+    const sourceMatch = /^\/notify\/([a-z0-9-]{1,32})$/i.exec(requestUrl.pathname);
+    const requestedSource = sourceMatch ? sourceMatch[1].toLowerCase() : '';
+    const source = TASK_NOTIFICATION_SOURCES.has(requestedSource) ? requestedSource : null;
+    if (request.method !== 'POST' || (!source && !isClaudeUsage)) {
+      sendTaskNotificationResponse(response, 404, { ok: false, error: 'not_found' });
+      return;
+    }
+    const contentType = String(request.headers['content-type'] || '')
+      .split(';', 1)[0]
+      .trim()
+      .toLowerCase();
+    if (contentType !== 'application/json') {
+      sendTaskNotificationResponse(response, 415, {
+        ok: false,
+        error: 'application_json_required',
+      });
+      return;
+    }
+
+    const chunks = [];
+    let bodyLength = 0;
+    let bodyTooLarge = false;
+    request.on('data', (chunk) => {
+      bodyLength += chunk.length;
+      if (bodyLength > TASK_NOTIFICATION_BODY_LIMIT) {
+        bodyTooLarge = true;
+        chunks.length = 0;
+        return;
+      }
+      if (!bodyTooLarge) chunks.push(chunk);
+    });
+    request.on('end', () => {
+      if (bodyTooLarge) {
+        sendTaskNotificationResponse(response, 413, { ok: false, error: 'body_too_large' });
+        return;
+      }
+      let payload;
+      try {
+        const rawBody = Buffer.concat(chunks).toString('utf8').trim();
+        payload = rawBody ? JSON.parse(rawBody) : {};
+      } catch (error) {
+        sendTaskNotificationResponse(response, 400, { ok: false, error: 'invalid_json' });
+        return;
+      }
+      if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+        sendTaskNotificationResponse(response, 400, { ok: false, error: 'invalid_payload' });
+        return;
+      }
+      if (isClaudeUsage) {
+        const accepted = agentUsageMonitor.setClaudeQuota(payload);
+        if (accepted) void agentUsageMonitor.tick();
+        sendTaskNotificationResponse(response, accepted ? 202 : 400, { ok: accepted });
+        return;
+      }
+      const result = enqueueTaskNotification(normalizeTaskNotification(payload, source));
+      sendTaskNotificationResponse(response, 202, { ok: true, result });
+    });
+    request.on('error', () => {
+      if (!response.headersSent) sendTaskNotificationResponse(response, 400, { ok: false });
+    });
+  });
+  notificationServer = server;
+
+  server.on('clientError', (error, socket) => {
+    if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+  });
+  server.once('listening', () => {
+    if (notificationServer !== server) return;
+    notificationServerAvailable = true;
+    refreshTrayMenu();
+  });
+  server.on('error', (error) => {
+    if (notificationServer === server) notificationServer = null;
+    notificationServerAvailable = false;
+    refreshTrayMenu();
+    console.warn(`Task notification server unavailable: ${error.message}`);
+  });
+  server.listen(TASK_NOTIFICATION_PORT, TASK_NOTIFICATION_HOST);
+}
+
+function stopTaskNotificationServer() {
+  const server = notificationServer;
+  notificationServer = null;
+  notificationServerAvailable = false;
+  if (server) server.close();
+}
+
+ipcMain.on('task-notification:hover', (event, paused) => {
+  if (
+    islandWindow &&
+    !islandWindow.isDestroyed() &&
+    event.sender === islandWindow.webContents
+  ) {
+    setTaskNotificationPaused(paused === true);
+  }
+});
+
+ipcMain.on('task-notification:dismissed', (event, eventId) => {
+  if (
+    islandWindow &&
+    !islandWindow.isDestroyed() &&
+    event.sender === islandWindow.webContents &&
+    typeof eventId === 'string'
+  ) {
+    finishTaskNotification(eventId);
+  }
+});
+
+function isIslandSender(event) {
+  return Boolean(islandWindow && !islandWindow.isDestroyed() && event.sender === islandWindow.webContents);
+}
+
+// 悬停明细：渲染层先申请放大窗口再播入场；退场播完再申请缩回。
+ipcMain.handle('island:peek', (event, payload) => {
+  if (!isIslandSender(event) || activeTaskNotification) return false;
+  const open = Boolean(payload && payload.open === true);
+  const height = open
+    ? Math.max(0, Math.min(ISLAND_PEEK_MAX_HEIGHT, Math.round(Number(payload.height) || 0)))
+    : 0;
+  islandPeekHeight = islandLiveVisible() ? height : 0;
+  syncIsland();
+  return islandPeekHeight > 0;
+});
+
+function summonPanel() {
+  if (!mainWindow || mainWindow.isDestroyed() || currentMode === 'expanded') return;
+  hideWhenCollapsed = false;
+  if (!mainWindow.isVisible()) mainWindow.show();
+  mainWindow.focus();
+  mainWindow.webContents.send('shortcut:toggle-panel');
+}
+
+// live 形态的岛盖在折叠条上方，点击由岛转交给主面板展开。
+ipcMain.on('island:open-panel', (event) => {
+  if (!isIslandSender(event)) return;
+  islandPeekHeight = 0;
+  summonPanel();
+});
+
+const notchGeometry = createNotchGeometry({
+  fallbackWidth: COLLAPSED_WIDTH,
+  onChange: () => syncIsland(),
+});
+
+const agentUsageMonitor = createAgentUsageMonitor({
+  onSnapshot: (snapshot) => {
+    usageSnapshot = snapshot;
+    sendIslandUsage();
+    syncIsland();
+  },
+  onCompletion: (completion) => {
+    enqueueTaskNotification({
+      eventId: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
+      source: completion.source,
+      channel: 'monitor',
+      taskId: completion.turnId || completion.sessionId,
+      title: completion.title || (completion.source === 'codex' ? 'Codex 任务已完成' : 'Claude 任务已完成'),
+      project: completion.project,
+      completedAt: Date.now(),
+    });
+  },
+});
+
+function setAgentMonitorEnabled(enabled) {
+  agentMonitorEnabled = enabled === true;
+  if (agentMonitorEnabled) {
+    agentUsageMonitor.start();
+  } else {
+    agentUsageMonitor.stop();
+    usageSnapshot = { codex: null, claude: null, updatedAt: 0 };
+  }
+  sendIslandUsage();
+  syncIsland();
+}
+
+function createWindow() {
+  const initial = getCenteredBounds(COLLAPSED_WIDTH, getCollapsedHeight(getTargetDisplay()));
+
+  mainWindow = new BrowserWindow({
+    width: initial.width,
+    height: initial.height,
+    x: initial.x,
+    y: initial.y,
+    frame: false,
+    transparent: true,
+    // 必须显式给透明底色：只写 transparent 时 BrowserWindow 仍保留不透明的默认底色，
+    // 展开瞬间 setBounds 放大后，新暴露的区域会先用它画一两帧，
+    // 在菜单栏带上表现为一次黑块闪烁（通知窗口一直是这么写的）。
+    backgroundColor: '#00000000',
+    resizable: false,
+    movable: false,
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    hasShadow: true,
+    acceptFirstMouse: true,
+    hiddenInMissionControl: true,
+    fullscreenable: false,
+    minimizable: false,
+    maximizable: false,
+    roundedCorners: false,
+    show: false,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  });
+
+  installLocalWebContentsGuards(mainWindow.webContents);
+  installDisplayMediaHandler(mainWindow.webContents.session);
+
+  applyPanelWindowLevel();
+  if (process.platform === 'darwin') {
+    // skipTransformProcessType：避免为了全空间可见而改进程类型，那会让输入法候选窗无法附着。
+    mainWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true, skipTransformProcessType: true });
+  }
+  if (process.platform === 'win32') mainWindow.setMenu(null);
+
+  // Escape 在到达页面前会被 Chromium 浏览器层吞掉（实测 document keydown 收不到），
+  // 用 before-input-event 在分发前拦截并转发给渲染层处理（退出输入 / 收起面板）
+  mainWindow.webContents.on('before-input-event', (event, input) => {
+    if (input.type === 'keyDown' && input.key === 'Escape') {
+      mainWindow.webContents.send('key:escape');
+    }
+  });
+
+  // 失焦时让渲染层走完整退场动画，再由渲染层请求缩小原生窗口。
+  mainWindow.on('blur', () => {
+    if (mediaPermissionRequests > 0 || transientSystemInteractionRequests > 0) {
+      cameraBlurDeferred = true;
+      return;
+    }
+    requestRendererCollapse();
+  });
+
+  mainWindow.on('focus', () => {
+    cameraBlurDeferred = false;
+  });
+  mainWindow.on('show', () => { syncHoverSpacePolling(); syncIsland(); });
+  mainWindow.on('hide', () => { syncHoverSpacePolling(); syncIsland(); });
+
+  // 页面重载（工作区恢复 / 切换）后旧的导入投递作废，等新页面重新声明就绪。
+  // 只在主框架真正换页时复位：子帧/同文档导航也会触发 did-start-loading，会把已就绪状态清掉后不再恢复。
+  mainWindow.webContents.on('did-start-navigation', (details) => {
+    if (!details || details.isSameDocument || details.isMainFrame === false) return;
+    resetTodoInboxRenderer();
+    resetLinkInboxRenderer();
+  });
+  mainWindow.webContents.on('render-process-gone', () => { resetTodoInboxRenderer(); resetLinkInboxRenderer(); });
+  const recordingSender = mainWindow.webContents;
+  recordingSender.on('destroyed', () => {
+    closeRecordingWriteSession(recordingSender.id, { discard: true });
+  });
+  recordingSender.on('render-process-gone', () => {
+    closeRecordingWriteSession(recordingSender.id, { discard: true });
+  });
+
+  mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+
+  mainWindow.once('ready-to-show', () => {
+    applyMode('collapsed');
+    mainWindow.show();
+  });
+
+  mainWindow.on('closed', () => {
+    cancelCollapseWatchdog();
+    hideWhenCollapsed = false;
+    mainWindow = null;
+  });
+
+  mainWindow.on('close', (event) => {
+    if (isQuitting) return;
+    event.preventDefault();
+    hideWindowAfterCollapse();
+  });
+}
+
+function toggleVisibility() {
+  if (!mainWindow) {
+    createWindow();
+    return;
+  }
+  if (mainWindow.isVisible()) {
+    hideWindowAfterCollapse();
+  } else {
+    hideWhenCollapsed = false;
+    repositionWindow(getTargetDisplay()); // 显示前先回到鼠标所在屏顶部
+    mainWindow.show();
+    refreshTrayMenu();
+  }
+}
+
+function isAutoLaunchEnabled() {
+  if (!PLATFORM_CAPABILITIES.autoLaunch) return false;
+  try {
+    return app.getLoginItemSettings().openAtLogin;
+  } catch (e) {
+    return false;
+  }
+}
+
+function setAutoLaunch(enabled) {
+  if (!PLATFORM_CAPABILITIES.autoLaunch) return false;
+  try {
+    app.setLoginItemSettings({ openAtLogin: enabled, openAsHidden: false });
+    return isAutoLaunchEnabled() === enabled;
+  } catch (e) {
+    return false;
+  }
+}
+
+const DEFAULT_FEATURES = {
+  home: true,
+  todo: true,
+  notes: true,
+  links: true,
+  recordings: true,
+  credentials: true,
+  clip: false,
+};
+
+function getJsonSettingsPath(name) {
+  return path.join(app.getPath('userData'), name);
+}
+
+function readJsonFile(filePath, fallback = {}) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : fallback;
+  } catch (error) {
+    return fallback;
+  }
+}
+
+function writeJsonFile(filePath, value) {
+  const temporaryPath = `${filePath}.${process.pid}.tmp`;
+  try {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(temporaryPath, JSON.stringify(value, null, 2), { mode: 0o600 });
+    fs.renameSync(temporaryPath, filePath);
+    if (path.basename(filePath) === WORKSPACE_SETTINGS_FILE) cachedWorkspaceRoot = null;
+    return true;
+  } catch (error) {
+    try { fs.unlinkSync(temporaryPath); } catch (unlinkError) {}
+    return false;
+  }
+}
+
+function readAppSettings() {
+  const stored = readJsonFile(getJsonSettingsPath(APP_SETTINGS_FILE));
+  const features = { ...DEFAULT_FEATURES, ...(stored.features || {}), home: true };
+  return {
+    features,
+    shortcut: isValidPanelShortcut(stored.shortcut) ? stored.shortcut : 'Space',
+    defaultTab: normalizeDefaultTabPreference(stored.defaultTab, features),
+    agentMonitor: stored.agentMonitor !== false,
+    musicPlayer: normalizeMusicPreference(stored.musicPlayer),
+    musicAutomation: Array.isArray(stored.musicAutomation)
+      ? stored.musicAutomation.filter((id) => typeof id === 'string').slice(0, 16)
+      : [],
+  };
+}
+
+function publicAppSettings() {
+  return { ...readAppSettings(), autoLaunch: isAutoLaunchEnabled() };
+}
+
+function saveAppSettings(settings) {
+  return writeJsonFile(getJsonSettingsPath(APP_SETTINGS_FILE), settings);
+}
+
+// 缓存：2 秒一次的收件箱扫描和工作区快照都要问「工作区在哪」，此前每次都同步读一遍设置文件。
+// 设置文件只会被本进程写（writeJsonFile 里统一失效）。
+let cachedWorkspaceRoot = null;
+function workspaceRoot() {
+  if (cachedWorkspaceRoot) return cachedWorkspaceRoot;
+  const settings = readJsonFile(getJsonSettingsPath(WORKSPACE_SETTINGS_FILE));
+  const configured = String(settings.path || '').trim();
+  cachedWorkspaceRoot = configured && path.isAbsolute(configured) ? configured : app.getPath('userData');
+  return cachedWorkspaceRoot;
+}
+
+function workspacePath(name) {
+  return path.join(workspaceRoot(), name);
+}
+
+function showOwnedOpenDialog(options) {
+  const owner = mainWindow && !mainWindow.isDestroyed() ? mainWindow : null;
+  if (owner) {
+    if (!owner.isVisible()) owner.show();
+    owner.focus();
+  }
+  return runOwnedOpenDialog(
+    dialog.showOpenDialog.bind(dialog),
+    owner,
+    options,
+    (delta) => {
+      transientSystemInteractionRequests = Math.max(0, transientSystemInteractionRequests + delta);
+      if (delta < 0 && transientSystemInteractionRequests === 0 && mediaPermissionRequests === 0) {
+        cameraBlurDeferred = false;
+      }
+    }
+  );
+}
+
+function copyWorkspaceAssets(sourceRoot, targetRoot) {
+  if (!sourceRoot || !targetRoot || path.resolve(sourceRoot) === path.resolve(targetRoot)) return;
+  for (const directory of [RECORDINGS_DIR_NAME, CLIP_IMAGES_DIR_NAME]) {
+    const source = path.join(sourceRoot, directory);
+    const target = path.join(targetRoot, directory);
+    try {
+      if (!fs.existsSync(source) || !fs.lstatSync(source).isDirectory()) continue;
+      fs.mkdirSync(target, { recursive: true });
+      fs.cpSync(source, target, { recursive: true, force: false, errorOnExist: false });
+    } catch (error) {}
+  }
+  for (const filename of [WORKSPACE_DATA_FILE, MIRROR_IMAGE_FILE]) {
+    const source = path.join(sourceRoot, filename);
+    const target = path.join(targetRoot, filename);
+    try {
+      if (fs.existsSync(source) && fs.lstatSync(source).isFile() && !fs.existsSync(target)) {
+        fs.copyFileSync(source, target, fs.constants.COPYFILE_EXCL);
+      }
+    } catch (error) {}
+  }
+}
+
+async function chooseWorkspaceFolder() {
+  const result = await showOwnedOpenDialog({
+    title: '选择 TO-DO Panel 数据文件夹',
+    properties: ['openDirectory', 'createDirectory'],
+  });
+  const selected = !result.canceled && result.filePaths && result.filePaths[0];
+  if (!selected) return false;
+  const previousRoot = workspaceRoot();
+  copyWorkspaceAssets(previousRoot, selected);
+  if (!writeJsonFile(getJsonSettingsPath(WORKSPACE_SETTINGS_FILE), { path: selected })) return false;
+  for (const directory of [RECORDINGS_DIR_NAME, CLIP_IMAGES_DIR_NAME, TODO_INBOX_DIR_NAME, WORK_INBOX_DIR_NAME, LINK_INBOX_DIR_NAME, WORK_REPORTS_DIR_NAME]) {
+    try { fs.mkdirSync(path.join(selected, directory), { recursive: true }); } catch (error) {}
+  }
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('workspace:changed', { path: selected });
+  refreshTrayMenu();
+  return true;
+}
+
+function applyFeatureServices(features) {
+  const policy = clipboardServicePolicy(features);
+  clipFeatureEnabled = policy.recordHistory === true;
+  if (policy.recordHistory) startClipboardPolling();
+  else stopClipboardPolling();
+}
+
+function isValidPanelShortcut(shortcut) {
+  if (shortcut === 'Space') return true;
+  if (typeof shortcut !== 'string' || shortcut.length > 80) return false;
+  const tokens = shortcut.split('+');
+  if (tokens.length < 2) return false;
+  const key = tokens.pop();
+  const modifiers = new Set(['CommandOrControl', 'Command', 'Control', 'Alt', 'Option', 'Shift']);
+  return tokens.length > 0
+    && tokens.every((token) => modifiers.has(token))
+    && /^(?:[A-Z0-9]|F(?:[1-9]|1[0-9]|2[0-4])|Space|Tab|Escape|Left|Right|Up|Down|Home|End|PageUp|PageDown|Backspace|Delete|Enter)$/.test(key);
+}
+
+function setPanelShortcut(shortcut) {
+  if (!isValidPanelShortcut(shortcut)) return false;
+  const previousShortcut = configuredShortcut || 'Space';
+  stopHoverSpaceShortcut();
+  if (configuredShortcut && configuredShortcut !== 'Space' && globalShortcut.isRegistered(configuredShortcut)) {
+    globalShortcut.unregister(configuredShortcut);
+  }
+  if (shortcut === 'Space') {
+    configuredShortcut = shortcut;
+    startHoverSpaceShortcut();
+    return true;
+  }
+  let registered = false;
+  try {
+    registered = globalShortcut.register(shortcut, () => {
+      if (!mainWindow || mainWindow.isDestroyed()) return;
+      hideWhenCollapsed = false;
+      if (!mainWindow.isVisible()) mainWindow.show();
+      mainWindow.focus();
+      mainWindow.webContents.send('shortcut:toggle-panel');
+    });
+  } catch (error) {}
+  if (registered) {
+    configuredShortcut = shortcut;
+    return true;
+  }
+  configuredShortcut = previousShortcut;
+  startHoverSpaceShortcut();
+  return false;
+}
+
+function applyAppSettings() {
+  const settings = readAppSettings();
+  applyFeatureServices(settings.features);
+  if (settings.agentMonitor !== agentMonitorEnabled) setAgentMonitorEnabled(settings.agentMonitor);
+  if (!setPanelShortcut(settings.shortcut)) {
+    settings.shortcut = 'Space';
+    saveAppSettings(settings);
+    setPanelShortcut('Space');
+  }
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('settings:changed', publicAppSettings());
+}
+
+function openRendererPanel(channel) {
+  if (!mainWindow || mainWindow.isDestroyed()) createWindow();
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  hideWhenCollapsed = false;
+  repositionWindow(getTargetDisplay());
+  mainWindow.show();
+  const send = () => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel);
+  };
+  if (mainWindow.webContents.isLoadingMainFrame()) mainWindow.webContents.once('did-finish-load', send);
+  else send();
+}
+
+function mirrorImagePath() {
+  return workspacePath(MIRROR_IMAGE_FILE);
+}
+
+// 镜子配图：此前每次调用都在主线程同步解码 JPEG 再重编码成 PNG dataURL
+// （启动时两次，每次打开设置页一次）。按文件修改时间缓存。
+let mirrorImageCache = { key: '', dataUrl: null };
+function mirrorImageDataUrl() {
+  try {
+    const filePath = mirrorImagePath();
+    const stat = fs.statSync(filePath);
+    const key = `${filePath}:${stat.mtimeMs}:${stat.size}`;
+    if (mirrorImageCache.key === key) return mirrorImageCache.dataUrl;
+    const image = nativeImage.createFromPath(filePath);
+    const dataUrl = image.isEmpty() ? null : image.toDataURL();
+    mirrorImageCache = { key, dataUrl };
+    return dataUrl;
+  } catch (error) {
+    return null;
+  }
+}
+
+async function chooseMirrorImage() {
+  const result = await showOwnedOpenDialog({
+    title: '替换镜子配图',
+    properties: ['openFile'],
+    filters: [{ name: '图片', extensions: ['png', 'jpg', 'jpeg', 'webp', 'heic'] }],
+  });
+  const selected = !result.canceled && result.filePaths && result.filePaths[0];
+  if (!selected) return { ok: true, canceled: true };
+  try {
+    const image = nativeImage.createFromPath(selected);
+    if (image.isEmpty()) throw new Error('invalid_image');
+    const size = image.getSize();
+    if (!size.width || !size.height || size.width * size.height > 60_000_000) throw new Error('image_too_large');
+    fs.writeFileSync(mirrorImagePath(), image.toJPEG(92), { mode: 0o600 });
+    const dataUrl = mirrorImageDataUrl();
+    if (dataUrl && mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('mirror:image-changed', dataUrl);
+    }
+    return { ok: true, canceled: false, dataUrl };
+  } catch (error) {
+    await dialog.showMessageBox({ type: 'error', title: '无法替换配图', message: '请选择一张有效且尺寸适中的图片。' });
+    return { ok: false, error: 'invalid_image' };
+  }
+}
+
+function refreshTrayMenu() {
+  if (!tray) return;
+  const autoLaunch = isAutoLaunchEnabled();
+  const settings = readAppSettings();
+  const featureLabels = { todo: '待办', notes: '笔记', links: '链接', recordings: '录制', credentials: '密钥', clip: '剪贴板' };
+  const menu = Menu.buildFromTemplate([
+    {
+      label: 'API 配置…',
+      click: () => openRendererPanel('app:open-api-settings'),
+    },
+    {
+      label: '替换镜子配图…',
+      click: chooseMirrorImage,
+    },
+    {
+      label: '显示功能',
+      submenu: Object.entries(featureLabels).map(([id, label]) => ({
+        label,
+        type: 'checkbox',
+        checked: settings.features[id] !== false,
+        click: (item) => {
+          const next = readAppSettings();
+          next.features[id] = item.checked;
+          saveAppSettings(next);
+          applyAppSettings();
+          refreshTrayMenu();
+        },
+      })),
+    },
+    {
+      label: '灵动岛显示 AI 用量（Claude / Codex）',
+      type: 'checkbox',
+      checked: settings.agentMonitor,
+      click: (item) => {
+        const next = readAppSettings();
+        next.agentMonitor = item.checked;
+        saveAppSettings(next);
+        applyAppSettings();
+        refreshTrayMenu();
+      },
+    },
+    ...(musicChoices.length > 0 ? [{
+      label: '音乐播放器',
+      submenu: musicMenuItems(settings.musicPlayer),
+    }] : []),
+    {
+      label: `设置快捷键…  当前：${settings.shortcut}`,
+      click: () => openRendererPanel('app:record-shortcut'),
+    },
+    ...(process.platform === 'darwin' ? [{
+      label: '权限设置…',
+      click: openPermissionsWindow,
+    }] : []),
+    {
+      label: '数据文件夹',
+      submenu: [
+        { label: '打开文件夹', click: () => shell.openPath(workspaceRoot()) },
+        { label: '更换文件夹…', click: chooseWorkspaceFolder },
+      ],
+    },
+    { type: 'separator' },
+    {
+      label: '开机自动启动',
+      type: 'checkbox',
+      checked: autoLaunch,
+      click: (item) => {
+        setAutoLaunch(item.checked);
+        refreshTrayMenu();
+      },
+    },
+    { type: 'separator' },
+    {
+      label: '关于',
+      click: () => {
+        dialog.showMessageBox({
+          type: 'info',
+          title: '关于 TO-DO Panel',
+          message: 'TO-DO Panel',
+          detail:
+            `版本 ${app.getVersion()}\n\n一个开源、常驻屏幕顶部的本地工作台。工作区数据默认保存在本机；账号密码与 API Key 由系统安全存储加密。\n\nMIT License`,
+          buttons: ['查看 GitHub', '好'],
+          defaultId: 1,
+          cancelId: 1,
+          noLink: true,
+        }).then(({ response }) => {
+          if (response === 0) shell.openExternal('https://github.com/xiaopu-ai/TO-DO-Panel');
+        });
+      },
+    },
+    { type: 'separator' },
+    {
+      label: '退出',
+      accelerator: 'CommandOrControl+Q',
+      click: () => app.quit(),
+    },
+  ]);
+  tray.setContextMenu(menu);
+}
+
+function createTray() {
+  tray = new Tray(createNotchTrayIcon());
+  tray.setToolTip('TO-DO Panel');
+  tray.on('click', () => {
+    if (!mainWindow) return;
+    if (!mainWindow.isVisible()) {
+      hideWhenCollapsed = false;
+      repositionWindow(getTargetDisplay());
+      mainWindow.show();
+      refreshTrayMenu();
+    }
+  });
+  refreshTrayMenu();
+}
+
+ipcMain.handle('window:set-mode', async (event, mode) => {
+  // 「上一个前台应用」只有剪贴板的自动粘贴会用到，而读取它要起一个 osascript 进程
+  // （热启动上百毫秒，冷启动更久）。此前每次展开都在这里等它，等待期间折叠条已隐藏、
+  // 窗口还没放大，屏幕上什么都没有——这是展开卡顿的头号来源。
+  if (mode === 'expanded' && clipFeatureEnabled) await rememberPasteTarget();
+  applyMode(mode === 'expanded' ? 'expanded' : 'collapsed');
+});
+
+ipcMain.handle('window:begin-collapse', () => {
+  beginNativeCollapse();
+});
+
+ipcMain.on('window:ime-state', (event, payload) => {
+  if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) return;
+  updatePanelImeState(payload && typeof payload === 'object' ? payload : {});
+});
+
+ipcMain.handle('settings:get', () => publicAppSettings());
+ipcMain.handle('settings:set-feature', (event, payload) => {
+  const current = readAppSettings();
+  const features = updateFeaturePreference(current.features, payload && payload.featureId, payload && payload.enabled);
+  if (!features) return { ok: false, error: 'invalid_feature' };
+  const next = { ...current, features };
+  if (!saveAppSettings(next)) return { ok: false, error: 'save_failed' };
+  applyAppSettings();
+  refreshTrayMenu();
+  return { ok: true, settings: publicAppSettings() };
+});
+ipcMain.handle('settings:set-default-tab', (event, defaultTab) => {
+  const next = updateDefaultTabPreference(readAppSettings(), defaultTab);
+  if (!next) return { ok: false, error: 'invalid_default_tab' };
+  if (!saveAppSettings(next)) return { ok: false, error: 'save_failed' };
+  applyAppSettings();
+  return { ok: true, settings: publicAppSettings() };
+});
+ipcMain.handle('settings:set-auto-launch', (event, enabled) => {
+  if (typeof enabled !== 'boolean') return { ok: false, error: 'invalid' };
+  if (!setAutoLaunch(enabled)) return { ok: false, error: 'save_failed', autoLaunch: isAutoLaunchEnabled() };
+  const settings = publicAppSettings();
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('settings:changed', settings);
+  refreshTrayMenu();
+  return { ok: true, autoLaunch: settings.autoLaunch };
+});
+ipcMain.handle('settings:set-shortcut', (event, accelerator) => {
+  if (!isValidPanelShortcut(accelerator)) return { ok: false, error: 'invalid' };
+  if (!setPanelShortcut(accelerator)) return { ok: false, error: 'occupied' };
+  const next = readAppSettings();
+  next.shortcut = accelerator;
+  if (!saveAppSettings(next)) return { ok: false, error: 'save_failed' };
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('settings:changed', publicAppSettings());
+  refreshTrayMenu();
+  return { ok: true, shortcut: accelerator };
+});
+ipcMain.handle('workspace:get', () => ({ path: workspaceRoot(), portable: workspaceRoot() !== app.getPath('userData') }));
+ipcMain.handle('workspace:load-data', () => {
+  const payload = readJsonFile(workspacePath(WORKSPACE_DATA_FILE), {});
+  return payload && payload.localStorage && typeof payload.localStorage === 'object'
+    ? payload.localStorage
+    : {};
+});
+
+function normalizePortableStorage(storage) {
+  const portable = { ...storage };
+  const normalizers = [
+    ['notch-recordings', 'audioPath', RECORDINGS_DIR_NAME],
+    ['notch-clip-history', 'imagePath', CLIP_IMAGES_DIR_NAME],
+  ];
+  for (const [storageKey, property, directory] of normalizers) {
+    try {
+      const rows = JSON.parse(portable[storageKey]);
+      if (!Array.isArray(rows)) continue;
+      portable[storageKey] = JSON.stringify(rows.map((row) => {
+        if (!row || typeof row !== 'object' || !row[property]) return row;
+        return { ...row, [property]: platformPolicy.portableMediaPath(directory, row[property]) };
+      }));
+    } catch (error) {}
+  }
+  return portable;
+}
+
+ipcMain.handle('workspace:save-data', (event, storage) => {
+  if (!storage || typeof storage !== 'object' || Array.isArray(storage)) return false;
+  const portableStorage = normalizePortableStorage(storage);
+  const serialized = JSON.stringify(portableStorage);
+  if (Buffer.byteLength(serialized) > 8 * 1024 * 1024) return false;
+  const destination = workspacePath(WORKSPACE_DATA_FILE);
+  if (!workspacePersistenceGate.shouldWrite(portableStorage, destination)) return true;
+  const written = writeJsonFile(destination, {
+    version: 1,
+    updatedAt: Date.now(),
+    localStorage: portableStorage,
+  });
+  if (written) workspacePersistenceGate.markWritten(portableStorage, destination);
+  return written;
+});
+ipcMain.handle('workspace:open', () => shell.openPath(workspaceRoot()));
+ipcMain.handle('workspace:choose', () => chooseWorkspaceFolder());
+
+// ============ 待办导入收件箱 ============
+// 主进程只负责文件：发现、读取、归档与报告；合并由渲染层的纯函数完成，
+// 所以待办仍只有 localStorage 一个写入方，workspace.json 同步照旧。
+function todoInboxDir() {
+  return workspacePath(TODO_INBOX_DIR_NAME);
+}
+
+function ensureTodoInboxDir() {
+  try {
+    fs.mkdirSync(todoInboxDir(), { recursive: true });
+  } catch (error) {}
+}
+
+function hashFileSync(filePath) {
+  try {
+    return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
+  } catch (error) {
+    return null;
+  }
+}
+
+// 返回 false 表示移动失败，文件仍留在收件箱，下轮扫描只重试归档、不再导入。
+function archiveTodoInboxFile(filePath, expectedHash, report) {
+  const processedDir = path.join(path.dirname(filePath), TODO_INBOX_PROCESSED_DIR_NAME);
+  try {
+    fs.mkdirSync(processedDir, { recursive: true });
+  } catch (error) {
+    return false;
+  }
+  const names = todoInboxArchiveNames(path.basename(filePath), new Date(), (name) => fs.existsSync(path.join(processedDir, name)));
+  let archivedAs = null;
+  // 读取后脚本又改写了同名文件：新内容还没导入，不能被当作已处理移走。
+  const unchanged = expectedHash === null || hashFileSync(filePath) === expectedHash;
+  if (unchanged && fs.existsSync(filePath)) {
+    try {
+      fs.renameSync(filePath, path.join(processedDir, names.archive));
+      archivedAs = `${TODO_INBOX_PROCESSED_DIR_NAME}/${names.archive}`;
+    } catch (error) {
+      return false;
+    }
+  }
+  writeJsonFile(path.join(processedDir, names.report), { ...report, archivedAs });
+  return true;
+}
+
+function finishTodoInboxFile(filePath, hash, report) {
+  todoInboxUnarchived.set(filePath, { hash, report });
+  if (archiveTodoInboxFile(filePath, hash, report)) todoInboxUnarchived.delete(filePath);
+}
+
+function scanTodoInbox() {
+  if (!todoInboxRendererReady || !mainWindow || mainWindow.isDestroyed()) return;
+  const now = Date.now();
+  for (const [token, job] of todoInboxInFlight) {
+    // 渲染层重载或无响应：放弃这次投递，下轮重发；稳定 id 保证重发不会重复添加。
+    if (now - job.sentAt > TODO_INBOX_ACK_TIMEOUT_MS) todoInboxInFlight.delete(token);
+  }
+  const directory = todoInboxDir();
+  let names;
+  try {
+    names = fs.readdirSync(directory).filter(isTodoInboxCandidate).sort();
+  } catch (error) {
+    return;
+  }
+  const present = new Set(names.map((name) => path.join(directory, name)));
+  for (const tracked of [todoInboxUnarchived, todoInboxRetryAt]) {
+    for (const filePath of tracked.keys()) {
+      if (path.dirname(filePath) === directory && !present.has(filePath)) tracked.delete(filePath);
+    }
+  }
+  const busy = new Set([...todoInboxInFlight.values()].map((job) => job.filePath));
+  for (const name of names) {
+    const filePath = path.join(directory, name);
+    if (busy.has(filePath) || (todoInboxRetryAt.get(filePath) || 0) > now) continue;
+    let stat;
+    try {
+      stat = fs.lstatSync(filePath);
+    } catch (error) {
+      continue;
+    }
+    if (!stat.isFile() || now - stat.mtimeMs < TODO_INBOX_SETTLE_MS) continue;
+    let parsed;
+    if (stat.size > TODO_INBOX_MAX_BYTES) {
+      parsed = { ok: false, hash: null, error: `文件超过 ${TODO_INBOX_MAX_BYTES / 1024} KB 上限` };
+    } else {
+      try {
+        parsed = parseTodoInboxBuffer(fs.readFileSync(filePath));
+      } catch (error) {
+        continue;
+      }
+    }
+    const pending = todoInboxUnarchived.get(filePath);
+    if (pending && pending.hash === parsed.hash) {
+      finishTodoInboxFile(filePath, pending.hash, pending.report);
+      continue;
+    }
+    if (!parsed.ok) {
+      finishTodoInboxFile(filePath, parsed.hash, buildTodoInboxReport({ fileName: name, error: parsed.error }));
+      continue;
+    }
+    const token = crypto.randomUUID();
+    todoInboxInFlight.set(token, { filePath, fileName: name, hash: parsed.hash, sentAt: now });
+    mainWindow.webContents.send('todo-inbox:import', {
+      token,
+      fileName: name,
+      sourceId: parsed.hash.slice(0, 12),
+      payload: parsed.payload,
+    });
+  }
+}
+
+function resetTodoInboxRenderer() {
+  todoInboxRendererReady = false;
+  todoInboxInFlight.clear();
+}
+
+function startTodoInboxWatcher() {
+  ensureTodoInboxDir();
+  if (!todoInboxTimer) todoInboxTimer = setInterval(scanTodoInbox, TODO_INBOX_POLL_MS);
+}
+
+function stopTodoInboxWatcher() {
+  if (todoInboxTimer) clearInterval(todoInboxTimer);
+  todoInboxTimer = null;
+}
+
+// 渲染层完成工作区恢复后才声明就绪；启动时的首次检查也由这里触发。
+ipcMain.handle('todo-inbox:ready', (event) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) return false;
+  todoInboxRendererReady = true;
+  ensureTodoInboxDir();
+  scanTodoInbox();
+  return true;
+});
+
+ipcMain.handle('todo-inbox:complete', (event, token, result) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) return false;
+  const job = todoInboxInFlight.get(String(token || ''));
+  if (!job) return false;
+  todoInboxInFlight.delete(String(token));
+  if (!result || typeof result !== 'object' || result.retry === true) {
+    todoInboxRetryAt.set(job.filePath, Date.now() + TODO_INBOX_RETRY_MS);
+    return false;
+  }
+  // 先把 localStorage 落盘再移走源文件，避免崩溃时两边都丢。
+  try {
+    mainWindow.webContents.session.flushStorageData();
+  } catch (error) {}
+  finishTodoInboxFile(job.filePath, job.hash, buildTodoInboxReport({ fileName: job.fileName, result }));
+  return true;
+});
+
+// ============ 工作报告收件箱（work-inbox）与落盘（work-reports） ============
+// 任意能在本机写文件的 AI 或脚本把 *.json 放到工作区 work-inbox/ 即可；
+// 主进程校验后写入 work-reports/daily/YYYY-MM-DD.json 或 work-reports/weekly/YYYY-Www.json
+//（同一周期的新文件会覆盖展示中的报告），再把源文件移入 processed/。不经渲染层合并。
+// 待办请仍写入 todo-inbox/，本收件箱不会导入 todos。
+
+function workInboxDir() {
+  return workspacePath(WORK_INBOX_DIR_NAME);
+}
+
+function linkInboxDir() {
+  return workspacePath(LINK_INBOX_DIR_NAME);
+}
+
+function ensureWorkspaceInboxDirs() {
+  for (const name of [
+    TODO_INBOX_DIR_NAME,
+    WORK_INBOX_DIR_NAME,
+    LINK_INBOX_DIR_NAME,
+    WORK_REPORTS_DIR_NAME,
+    path.join(WORK_REPORTS_DIR_NAME, 'daily'),
+    path.join(WORK_REPORTS_DIR_NAME, 'weekly'),
+  ]) {
+    try { fs.mkdirSync(workspacePath(name), { recursive: true }); } catch (error) {}
+  }
+}
+
+function workReportFilePath(kind, period) {
+  const folder = kind === 'weekly' ? 'weekly' : 'daily';
+  const safe = String(period || '');
+  if (kind === 'weekly' && !/^\d{4}-W\d{2}$/.test(safe)) return null;
+  if (kind !== 'weekly' && !/^\d{4}-\d{2}-\d{2}$/.test(safe)) return null;
+  return path.join(workspacePath(WORK_REPORTS_DIR_NAME), folder, `${safe}.json`);
+}
+
+function writeAcceptedWorkReport(report) {
+  const filePath = workReportFilePath(report.kind, report.period);
+  if (!filePath) return false;
+  return writeJsonFile(filePath, {
+    kind: report.kind,
+    ...(report.kind === 'weekly' ? { week: report.week } : { date: report.date }),
+    title: report.title || '',
+    body: report.body,
+    updatedAt: new Date().toISOString(),
+  });
+}
+
+function readAcceptedWorkReport(kind, period) {
+  const filePath = workReportFilePath(kind, period);
+  if (!filePath) return null;
+  const stored = readJsonFile(filePath, null);
+  if (!stored || typeof stored.body !== 'string' || !stored.body.trim()) return null;
+  return stored;
+}
+
+function currentWorkReports(now = new Date()) {
+  const date = localDateKey(now);
+  const week = isoWeekKey(now);
+  return {
+    date,
+    week,
+    daily: date ? readAcceptedWorkReport('daily', date) : null,
+    weekly: week ? readAcceptedWorkReport('weekly', week) : null,
+  };
+}
+
+function notifyWorkReportsChanged() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  try {
+    mainWindow.webContents.send('work-reports:changed', currentWorkReports());
+  } catch (error) {}
+}
+
+function archiveGenericInboxFile(filePath, expectedHash, report) {
+  const processedDir = path.join(path.dirname(filePath), TODO_INBOX_PROCESSED_DIR_NAME);
+  try {
+    fs.mkdirSync(processedDir, { recursive: true });
+  } catch (error) {
+    return false;
+  }
+  const names = todoInboxArchiveNames(path.basename(filePath), new Date(), (name) => fs.existsSync(path.join(processedDir, name)));
+  let archivedAs = null;
+  const unchanged = expectedHash === null || hashFileSync(filePath) === expectedHash;
+  if (unchanged && fs.existsSync(filePath)) {
+    try {
+      fs.renameSync(filePath, path.join(processedDir, names.archive));
+      archivedAs = `${TODO_INBOX_PROCESSED_DIR_NAME}/${names.archive}`;
+    } catch (error) {
+      return false;
+    }
+  }
+  writeJsonFile(path.join(processedDir, names.report), { ...report, archivedAs });
+  return true;
+}
+
+let workInboxTimer = null;
+const workInboxUnarchived = new Map();
+
+function finishWorkInboxFile(filePath, hash, report) {
+  workInboxUnarchived.set(filePath, { hash, report });
+  if (archiveGenericInboxFile(filePath, hash, report)) workInboxUnarchived.delete(filePath);
+}
+
+function scanWorkInbox() {
+  const now = Date.now();
+  const directory = workInboxDir();
+  let names;
+  try {
+    names = fs.readdirSync(directory).filter(isTodoInboxCandidate).sort();
+  } catch (error) {
+    return;
+  }
+  const present = new Set(names.map((name) => path.join(directory, name)));
+  for (const filePath of workInboxUnarchived.keys()) {
+    if (path.dirname(filePath) === directory && !present.has(filePath)) workInboxUnarchived.delete(filePath);
+  }
+  for (const name of names) {
+    const filePath = path.join(directory, name);
+    let stat;
+    try {
+      stat = fs.lstatSync(filePath);
+    } catch (error) {
+      continue;
+    }
+    if (!stat.isFile() || now - stat.mtimeMs < TODO_INBOX_SETTLE_MS) continue;
+    let parsed;
+    if (stat.size > TODO_INBOX_MAX_BYTES) {
+      parsed = { ok: false, hash: null, error: `文件超过 ${TODO_INBOX_MAX_BYTES / 1024} KB 上限` };
+    } else {
+      try {
+        parsed = parseTodoInboxBuffer(fs.readFileSync(filePath));
+      } catch (error) {
+        continue;
+      }
+    }
+    const pending = workInboxUnarchived.get(filePath);
+    if (pending && pending.hash === parsed.hash) {
+      finishWorkInboxFile(filePath, pending.hash, pending.report);
+      continue;
+    }
+    if (!parsed.ok) {
+      finishWorkInboxFile(filePath, parsed.hash, buildWorkInboxReport({ fileName: name, error: parsed.error }));
+      continue;
+    }
+    const processed = parseWorkInboxPayload(parsed.payload);
+    let written = 0;
+    const imported = [];
+    if (!processed.error) {
+      for (const report of processed.reports) {
+        if (writeAcceptedWorkReport(report)) {
+          written += 1;
+          imported.push({
+            index: 0,
+            kind: report.kind,
+            period: report.period,
+            title: report.title,
+          });
+        }
+      }
+    }
+    if (processed.error && !written) {
+      finishWorkInboxFile(filePath, parsed.hash, buildWorkInboxReport({
+        fileName: name,
+        error: processed.error,
+        result: { skipped: processed.skipped, warnings: processed.warnings },
+      }));
+      continue;
+    }
+    if (processed.reports.length && !written) {
+      // 报告已解析但落盘失败：留下源文件，下一轮重试。
+      continue;
+    }
+    finishWorkInboxFile(filePath, parsed.hash, buildWorkInboxReport({
+      fileName: name,
+      result: {
+        imported,
+        skipped: processed.skipped,
+        warnings: processed.warnings,
+      },
+    }));
+    if (written) notifyWorkReportsChanged();
+  }
+}
+
+function startWorkInboxWatcher() {
+  ensureWorkspaceInboxDirs();
+  if (!workInboxTimer) workInboxTimer = setInterval(scanWorkInbox, TODO_INBOX_POLL_MS);
+  scanWorkInbox();
+}
+
+function stopWorkInboxWatcher() {
+  if (workInboxTimer) clearInterval(workInboxTimer);
+  workInboxTimer = null;
+}
+
+ipcMain.handle('work-reports:get', () => currentWorkReports());
+
+// ============ 链接导入收件箱（link-inbox） ============
+// 任意能在本机写文件的 AI 或脚本把 *.json 放到工作区 link-inbox/；
+// 主进程只负责发现、读取、归档；合并与分类由渲染层走 addLink / classifyLink 同一条路径。
+let linkInboxTimer = null;
+let linkInboxRendererReady = false;
+const linkInboxInFlight = new Map();
+const linkInboxUnarchived = new Map();
+const linkInboxRetryAt = new Map();
+
+function finishLinkInboxFile(filePath, hash, report) {
+  linkInboxUnarchived.set(filePath, { hash, report });
+  if (archiveGenericInboxFile(filePath, hash, report)) linkInboxUnarchived.delete(filePath);
+}
+
+function scanLinkInbox() {
+  if (!linkInboxRendererReady || !mainWindow || mainWindow.isDestroyed()) return;
+  const now = Date.now();
+  for (const [token, job] of linkInboxInFlight) {
+    if (now - job.sentAt > TODO_INBOX_ACK_TIMEOUT_MS) linkInboxInFlight.delete(token);
+  }
+  const directory = linkInboxDir();
+  let names;
+  try {
+    names = fs.readdirSync(directory).filter(isTodoInboxCandidate).sort();
+  } catch (error) {
+    return;
+  }
+  const present = new Set(names.map((name) => path.join(directory, name)));
+  for (const tracked of [linkInboxUnarchived, linkInboxRetryAt]) {
+    for (const filePath of tracked.keys()) {
+      if (path.dirname(filePath) === directory && !present.has(filePath)) tracked.delete(filePath);
+    }
+  }
+  const busy = new Set([...linkInboxInFlight.values()].map((job) => job.filePath));
+  for (const name of names) {
+    const filePath = path.join(directory, name);
+    if (busy.has(filePath) || (linkInboxRetryAt.get(filePath) || 0) > now) continue;
+    let stat;
+    try {
+      stat = fs.lstatSync(filePath);
+    } catch (error) {
+      continue;
+    }
+    if (!stat.isFile() || now - stat.mtimeMs < TODO_INBOX_SETTLE_MS) continue;
+    let parsed;
+    if (stat.size > TODO_INBOX_MAX_BYTES) {
+      parsed = { ok: false, hash: null, error: `文件超过 ${TODO_INBOX_MAX_BYTES / 1024} KB 上限` };
+    } else {
+      try {
+        parsed = parseTodoInboxBuffer(fs.readFileSync(filePath));
+      } catch (error) {
+        continue;
+      }
+    }
+    const pending = linkInboxUnarchived.get(filePath);
+    if (pending && pending.hash === parsed.hash) {
+      finishLinkInboxFile(filePath, pending.hash, pending.report);
+      continue;
+    }
+    if (!parsed.ok) {
+      finishLinkInboxFile(filePath, parsed.hash, buildLinkInboxReport({ fileName: name, error: parsed.error }));
+      continue;
+    }
+    const token = crypto.randomUUID();
+    linkInboxInFlight.set(token, { filePath, fileName: name, hash: parsed.hash, sentAt: now });
+    mainWindow.webContents.send('link-inbox:import', {
+      token,
+      fileName: name,
+      sourceId: parsed.hash.slice(0, 12),
+      payload: parsed.payload,
+    });
+  }
+}
+
+function resetLinkInboxRenderer() {
+  linkInboxRendererReady = false;
+  linkInboxInFlight.clear();
+}
+
+function startLinkInboxWatcher() {
+  ensureWorkspaceInboxDirs();
+  if (!linkInboxTimer) linkInboxTimer = setInterval(scanLinkInbox, TODO_INBOX_POLL_MS);
+}
+
+function stopLinkInboxWatcher() {
+  if (linkInboxTimer) clearInterval(linkInboxTimer);
+  linkInboxTimer = null;
+}
+
+ipcMain.handle('link-inbox:ready', (event) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) return false;
+  linkInboxRendererReady = true;
+  ensureWorkspaceInboxDirs();
+  scanLinkInbox();
+  return true;
+});
+
+ipcMain.handle('link-inbox:complete', (event, token, result) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) return false;
+  const job = linkInboxInFlight.get(String(token || ''));
+  if (!job) return false;
+  linkInboxInFlight.delete(String(token));
+  if (!result || typeof result !== 'object' || result.retry === true) {
+    linkInboxRetryAt.set(job.filePath, Date.now() + TODO_INBOX_RETRY_MS);
+    return false;
+  }
+  try {
+    mainWindow.webContents.session.flushStorageData();
+  } catch (error) {}
+  finishLinkInboxFile(job.filePath, job.hash, buildLinkInboxReport({ fileName: job.fileName, result }));
+  return true;
+});
+
+
+function getLayoutMetrics(display) {
+  const d = display || getWindowDisplay();
+  return {
+    stripHeight: getCollapsedHeight(d), // 折叠黑条总高（= 菜单栏高 = 物理刘海高，不含唇边）
+    menuBarHeight: getMenuBarHeight(d), // 折叠态菜单栏带高（折叠条上半部分被其拦截）
+    chromeY: EXPANDED_CHROME_Y,
+    tabSizes: TAB_SIZES,
+  };
+}
+
+ipcMain.handle('window:metrics', () => {
+  return getLayoutMetrics();
+});
+
+// Tab 仅改变内容；固定展开尺寸下不再触发原生窗口 resize。
+ipcMain.handle('window:set-tab', (event, tab) => {
+  currentTab = Object.prototype.hasOwnProperty.call(TAB_SIZES, tab) ? tab : 'home';
+});
+
+async function requestMacMediaAccess(mediaType) {
+  if (process.platform !== 'darwin') return true;
+  if (systemPreferences.getMediaAccessStatus(mediaType) === 'granted') return true;
+  return mediaPermissionCoordinator.run({
+    owner: mainWindow,
+    // screen-saver 层级会压住 macOS 的 TCC 授权气泡。请求前临时降到普通层，
+    // 并把应用激活，让“不允许 / 允许”确实处在可点击的最前方。
+    activate: () => app.focus({ steal: true }),
+    track: (delta) => {
+      if (delta > 0 && mediaType === 'camera') mediaPermissionBatchHadCamera = true;
+      mediaPermissionRequests = Math.max(0, mediaPermissionRequests + delta);
+      if (delta >= 0 || mediaPermissionRequests > 0) return;
+      const shouldCollapse = cameraBlurDeferred && mediaPermissionBatchHadCamera;
+      mediaPermissionBatchHadCamera = false;
+      cameraBlurDeferred = false;
+      if (!shouldCollapse) return;
+      const targetWindow = mainWindow;
+      setTimeout(() => {
+        if (
+          mainWindow === targetWindow &&
+          targetWindow &&
+          !targetWindow.isDestroyed() &&
+          !targetWindow.isFocused()
+        ) {
+          requestRendererCollapse();
+        }
+      }, 200);
+    },
+    request: () => systemPreferences.askForMediaAccess(mediaType),
+  });
+}
+
+// macOS 渲染层 getUserMedia 不会自动弹 TCC 授权，必须由主进程申请摄像头/麦克风权限。
+ipcMain.handle('media:camera', () => requestMacMediaAccess('camera'));
+ipcMain.handle('media:microphone', () => requestMacMediaAccess('microphone'));
+
+async function getPreferredScreenCapturerSource() {
+  const sources = await desktopCapturer.getSources({
+    types: ['screen'],
+    thumbnailSize: { width: 1, height: 1 },
+  });
+  if (!sources.length) return null;
+  let source = sources[0];
+  try {
+    const display = (typeof getWindowDisplay === 'function' && getWindowDisplay()) || screen.getPrimaryDisplay();
+    const match = sources.find((item) => String(item.display_id) === String(display.id));
+    if (match) source = match;
+  } catch (error) {}
+  return source;
+}
+
+async function getPreferredScreenSource() {
+  const source = await getPreferredScreenCapturerSource();
+  return source ? { id: source.id, name: source.name || '' } : null;
+}
+
+async function requestScreenRecordingAccess() {
+  if (process.platform !== 'darwin') return true;
+  if (systemPreferences.getMediaAccessStatus('screen') === 'granted') return true;
+  const granted = await mediaPermissionCoordinator.run({
+    owner: mainWindow,
+    activate: () => app.focus({ steal: true }),
+    request: async () => {
+      try {
+        await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 1, height: 1 } });
+      } catch (error) {}
+      return systemPreferences.getMediaAccessStatus('screen') === 'granted';
+    },
+  });
+  if (granted) return true;
+  const url = PRIVACY_SETTINGS_PANES['screen-recording'];
+  if (url) shell.openExternal(url);
+  return systemPreferences.getMediaAccessStatus('screen') === 'granted';
+}
+
+ipcMain.handle('media:screen-recording', () => requestScreenRecordingAccess());
+ipcMain.handle('media:screen-source', async () => {
+  try {
+    return await getPreferredScreenSource();
+  } catch (error) {
+    return null;
+  }
+});
+
+let displayMediaHandlerInstalled = false;
+function installDisplayMediaHandler(targetSession) {
+  if (!targetSession || typeof targetSession.setDisplayMediaRequestHandler !== 'function') return;
+  if (displayMediaHandlerInstalled) return;
+  displayMediaHandlerInstalled = true;
+  targetSession.setDisplayMediaRequestHandler(async (request, callback) => {
+    try {
+      const source = await getPreferredScreenCapturerSource();
+      if (!source) {
+        callback({});
+        return;
+      }
+      callback({ video: source });
+    } catch (error) {
+      callback({});
+    }
+  });
+}
+
+ipcMain.handle('tasks:recent', () => taskCompletionHistory);
+
+// 快捷链接：URL 走外部浏览器（仅 http/https），本地路径走系统打开（仅绝对路径）
+ipcMain.handle('shell:openExternal', (event, url) => {
+  if (typeof url === 'string' && /^https?:\/\//i.test(url)) {
+    return shell.openExternal(url);
+  }
+});
+
+ipcMain.handle('shell:openPath', (event, p) => {
+  if (typeof p === 'string' && path.isAbsolute(p)) {
+    return shell.openPath(p);
+  }
+});
+
+// 只放行固定的几个隐私面板，渲染层传来的值只能当作枚举的键来查，
+// 绝不能拼进 URL：x-apple.systempreferences: 能打开任意设置面板。
+const PRIVACY_SETTINGS_PANES = process.platform === 'win32' ? {
+  microphone: 'ms-settings:privacy-microphone',
+  camera: 'ms-settings:privacy-webcam',
+} : {
+  accessibility: 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility',
+  'screen-recording': 'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture',
+  microphone: 'x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone',
+  camera: 'x-apple.systempreferences:com.apple.preference.security?Privacy_Camera',
+};
+
+ipcMain.handle('shell:open-privacy-settings', (event, pane) => {
+  const target = PRIVACY_SETTINGS_PANES[String(pane || '')];
+  if (!target) return false;
+  shell.openExternal(target);
+  return true;
+});
+
+// ============ 启动时的权限自检 ============
+// DMG 装的是全新二进制，TCC 授权不会从开发版继承，而这几项缺失时的表现都是「静默失效」：
+// 缺「屏幕录制」→ CGWindowList 照样返回窗口但标题全空，当前窗口看起来像真的没窗口；
+// 缺「辅助功能」→ 枚举、聚焦窗口和汽水音乐发按键全部无效。
+// 系统对前者根本不弹提示，所以只能由应用自己说，否则用户完全无从下手。
+const PERMISSION_PROMPT_SKIP_FILE = 'permission-prompt-skipped';
+const PERMISSION_WELCOME_FILE = 'welcome-shown';
+
+// 权限引导窗口。此前用 dialog.showMessageBox：LSUIElement 应用没有 Dock 图标、启动时也不是
+// 前台应用，无父窗口的系统对话框会直接出现在别的窗口后面，用户根本看不到，也就无从授权。
+// 现在改成一个自己的普通窗口：浮在其他窗口之上、主动拿到前台，逐项列出权限，
+// 每项一个按钮——能弹系统授权框的直接弹，只能手动开的直接跳到系统设置对应那一页，
+// 并每秒回读状态，用户拨完开关这里立刻打勾。
+let permissionsWindow = null;
+let accessibilityPromptShown = false;
+
+function readPermissionStatuses() {
+  if (process.platform !== 'darwin') return {};
+  return {
+    accessibility: systemPreferences.isTrustedAccessibilityClient(false) ? 'granted' : 'denied',
+    'screen-recording': systemPreferences.getMediaAccessStatus('screen'),
+    microphone: systemPreferences.getMediaAccessStatus('microphone'),
+    camera: systemPreferences.getMediaAccessStatus('camera'),
+  };
+}
+
+function isPermissionsSender(event) {
+  return Boolean(
+    permissionsWindow
+    && !permissionsWindow.isDestroyed()
+    && event.sender === permissionsWindow.webContents
+  );
+}
+
+function openPermissionsWindow() {
+  if (process.platform !== 'darwin') return;
+  if (permissionsWindow && !permissionsWindow.isDestroyed()) {
+    permissionsWindow.show();
+    app.focus({ steal: true });
+    permissionsWindow.focus();
+    return;
+  }
+  permissionsWindow = new BrowserWindow({
+    width: 560,
+    height: 730,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    titleBarStyle: 'hiddenInset',
+    backgroundColor: '#111113',
+    alwaysOnTop: true,
+    show: false,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload-permissions.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  });
+  installLocalWebContentsGuards(permissionsWindow.webContents);
+  const targetWindow = permissionsWindow;
+  targetWindow.loadFile(path.join(__dirname, 'renderer', 'permissions.html'));
+  targetWindow.once('ready-to-show', () => {
+    if (targetWindow.isDestroyed()) return;
+    targetWindow.show();
+    app.focus({ steal: true });
+    targetWindow.focus();
+  });
+  targetWindow.on('closed', () => {
+    if (permissionsWindow === targetWindow) permissionsWindow = null;
+  });
+}
+
+ipcMain.handle('permissions:status', (event) => (
+  isPermissionsSender(event) ? buildPermissionList(readPermissionStatuses()) : []
+));
+
+ipcMain.handle('permissions:request', async (event, id) => {
+  if (!isPermissionsSender(event)) return false;
+  const statuses = readPermissionStatuses();
+  const item = buildPermissionList(statuses).find((entry) => entry.id === id);
+  if (!item || item.state === 'granted') return false;
+
+  if (item.state === 'prompt') {
+    // 摄像头 / 麦克风还没被问过：系统授权框一步到位，不必进系统设置。
+    try { await systemPreferences.askForMediaAccess(id); } catch (error) {}
+    return true;
+  }
+  // 以下两步只为把应用登记进系统设置的列表，否则用户打开面板可能找不到 TO-DO Panel 这一项。
+  if (id === 'accessibility' && !accessibilityPromptShown) {
+    accessibilityPromptShown = true;
+    systemPreferences.isTrustedAccessibilityClient(true);
+  }
+  if (id === 'screen-recording' && statuses['screen-recording'] === 'not-determined') {
+    try {
+      await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 1, height: 1 } });
+    } catch (error) {}
+  }
+  const url = permissionSettingsUrl(id);
+  if (!url) return false;
+  await shell.openExternal(url);
+  return true;
+});
+
+ipcMain.on('permissions:relaunch', (event) => {
+  if (!isPermissionsSender(event)) return;
+  app.relaunch();
+  app.quit();
+});
+
+ipcMain.on('permissions:close', (event, payload) => {
+  if (!isPermissionsSender(event)) return;
+  const skipFlag = path.join(app.getPath('userData'), PERMISSION_PROMPT_SKIP_FILE);
+  try {
+    if (payload && payload.skip === true) fs.writeFileSync(skipFlag, new Date().toISOString());
+  } catch (error) {}
+  permissionsWindow.close();
+});
+
+// 启动自检：只在缺少必需权限、且用户没有勾选「不再自动显示」时打开引导窗口。
+// 这里只查询状态，不触碰任何会弹系统框的接口。
+function showPermissionsOnboardingIfNeeded() {
+  if (process.platform !== 'darwin') return;
+  const userData = app.getPath('userData');
+  // 第一次启动一定显示一次：应用没有 Dock 图标，折叠条又藏在刘海里，
+  // 新用户装完双击后屏幕上什么都没出现，根本不知道它在哪、怎么打开。窗口里带着用法说明。
+  const welcomeFlag = path.join(userData, PERMISSION_WELCOME_FILE);
+  if (!fs.existsSync(welcomeFlag)) {
+    try { fs.writeFileSync(welcomeFlag, new Date().toISOString()); } catch (error) {}
+    openPermissionsWindow();
+    return;
+  }
+  if (fs.existsSync(path.join(userData, PERMISSION_PROMPT_SKIP_FILE))) return;
+  if (missingRequiredPermissions(readPermissionStatuses()).length === 0) return;
+  openPermissionsWindow();
+}
+
+async function validatePublicHttpUrl(value) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch (error) {
+    return null;
+  }
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return null;
+  const hostname = url.hostname.toLowerCase();
+  if (!hostname || hostname === 'localhost' || hostname.endsWith('.local')) return null;
+  let addresses;
+  try {
+    addresses = await dns.promises.lookup(hostname, { all: true, verbatim: true });
+  } catch (error) {
+    return null;
+  }
+  if (!addresses.length || addresses.some((item) => isPrivateAddress(item.address))) return null;
+  return url;
+}
+
+async function readResponseText(response) {
+  if (!response.body) return '';
+  const reader = response.body.getReader();
+  const chunks = [];
+  let size = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > LINK_FETCH_MAX_BYTES) {
+      await reader.cancel();
+      break;
+    }
+    chunks.push(Buffer.from(value));
+  }
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+async function fetchFaviconDataUrl(pageUrl, html) {
+  let candidate;
+  try {
+    const href = extractFaviconHref(html) || '/favicon.ico';
+    candidate = await validatePublicHttpUrl(new URL(href, pageUrl).toString());
+  } catch (error) {
+    candidate = null;
+  }
+  if (!candidate) return '';
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 3500);
+  try {
+    const response = await fetch(candidate, { signal: controller.signal, redirect: 'error' });
+    const type = String(response.headers.get('content-type') || '').split(';', 1)[0].toLowerCase();
+    if (!response.ok || !type.startsWith('image/')) return '';
+    const bytes = Buffer.from(await response.arrayBuffer());
+    if (!bytes.length || bytes.length > 160 * 1024) return '';
+    return `data:${type};base64,${bytes.toString('base64')}`;
+  } catch (error) {
+    return '';
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function enrichLinkMetadata(url, title) {
+  const config = resolveLlmConfig();
+  if (!config.apiKey || !config.model) return { title, category: '' };
+  const endpoint = config.baseUrl.endsWith('/chat/completions')
+    ? config.baseUrl
+    : `${config.baseUrl.replace(/\/$/, '')}/chat/completions`;
+  const safeEndpoint = await validatePublicHttpUrl(endpoint);
+  if (!safeEndpoint) return { title, category: '' };
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), LINK_FETCH_TIMEOUT_MS);
+  try {
+    const response = await fetch(safeEndpoint, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${config.apiKey}`,
+        'Content-Type': 'application/json',
+        'User-Agent': 'DynamicPanel/0.3 (+local bookmark organizer)',
+      },
+      body: JSON.stringify({
+        model: config.model,
+        temperature: 0.1,
+        response_format: { type: 'json_object' },
+        ...(config.baseUrl.includes('deepseek.com') ? { thinking: { type: 'disabled' } } : {}),
+        messages: [
+          {
+            role: 'system',
+            content: '你是网址收藏夹整理器。只返回 JSON：{"title":"简洁中文名称","category":"短分类"}。分类应稳定、可复用，不超过 14 个字。',
+          },
+          { role: 'user', content: `URL: ${url}\n网页标题: ${title}` },
+        ],
+      }),
+    });
+    if (!response.ok) return { title, category: '' };
+    const payload = await response.json();
+    const content = payload && payload.choices && payload.choices[0] && payload.choices[0].message && payload.choices[0].message.content;
+    const parsed = parseSmartLinkMetadata(content);
+    if (!parsed) return { title, category: '' };
+    return { title: parsed.title || title, category: parsed.category };
+  } catch (error) {
+    return { title, category: '' };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function inspectLink(rawUrl) {
+  let current = await validatePublicHttpUrl(rawUrl);
+  if (!current) return { ok: false, error: 'invalid_or_private_url' };
+  for (let redirectCount = 0; redirectCount <= LINK_FETCH_MAX_REDIRECTS; redirectCount++) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), LINK_FETCH_TIMEOUT_MS);
+    let response;
+    try {
+      response = await fetch(current, {
+        redirect: 'manual',
+        signal: controller.signal,
+        headers: {
+          Accept: 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.2',
+          'User-Agent': 'DynamicPanel/0.3 (+local bookmark metadata)',
+        },
+      });
+    } catch (error) {
+      clearTimeout(timeout);
+      // URL 已经过公网与协议校验；正文不可读不应阻止收藏，仍尝试抓站点根图标。
+      const icon = await fetchFaviconDataUrl(current.toString(), '');
+      return {
+        ok: true,
+        url: current.toString(),
+        title: '未命名',
+        category: '',
+        icon,
+        warning: error && error.name === 'AbortError' ? 'timeout' : 'fetch_failed',
+      };
+    }
+    clearTimeout(timeout);
+
+    if ([301, 302, 303, 307, 308].includes(response.status)) {
+      const location = response.headers.get('location');
+      if (!location || redirectCount >= LINK_FETCH_MAX_REDIRECTS) {
+        return { ok: false, error: 'too_many_redirects' };
+      }
+      current = await validatePublicHttpUrl(new URL(location, current).toString());
+      if (!current) return { ok: false, error: 'unsafe_redirect' };
+      continue;
+    }
+
+    const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+    const fallback = current.hostname.replace(/^www\./, '');
+    if (!response.ok || (!contentType.includes('text/html') && !contentType.includes('xhtml'))) {
+      const [smart, icon] = await Promise.all([
+        enrichLinkMetadata(current.toString(), fallback),
+        fetchFaviconDataUrl(current.toString(), ''),
+      ]);
+      return { ok: true, url: current.toString(), title: smart.title || '未命名', category: smart.category, icon };
+    }
+    const html = await readResponseText(response);
+    const pageTitle = extractPageTitle(html, fallback);
+    const [smart, icon] = await Promise.all([
+      enrichLinkMetadata(current.toString(), pageTitle),
+      fetchFaviconDataUrl(current.toString(), html),
+    ]);
+    return { ok: true, url: current.toString(), title: smart.title, category: smart.category, icon };
+  }
+  return { ok: false, error: 'too_many_redirects' };
+}
+
+ipcMain.handle('links:inspect', (event, url) => inspectLink(url));
+
+ipcMain.handle('smart:organize-material', async (event, payload) => {
+  const config = resolveLlmConfig();
+  const kind = payload && payload.kind === 'note' ? 'note' : 'material';
+  const transcript = String(payload && payload.text || '').trim().slice(0, 8000);
+  if (!transcript) return { ok: false, error: 'empty_text' };
+  if (!config.apiKey || !config.model) return { ok: false, error: 'not_configured' };
+  const endpoint = config.baseUrl.endsWith('/chat/completions')
+    ? config.baseUrl
+    : `${config.baseUrl.replace(/\/$/, '')}/chat/completions`;
+  const safeEndpoint = await validatePublicHttpUrl(endpoint);
+  if (!safeEndpoint) return { ok: false, error: 'invalid_endpoint' };
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 9000);
+  try {
+    const response = await fetch(safeEndpoint, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: { Authorization: `Bearer ${config.apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: config.model,
+        temperature: 0.1,
+        response_format: { type: 'json_object' },
+        ...(config.baseUrl.includes('deepseek.com') ? { thinking: { type: 'disabled' } } : {}),
+        messages: [
+          {
+            role: 'system',
+            content: kind === 'note'
+              ? '你是中文笔记命名助手。理解整篇笔记后概括主题，禁止把正文首句直接当标题。只返回 JSON：{"title":"8到18字的具体标题","category":"2到8字的稳定分类"}。'
+              : '你是中文个人资料库整理器。根据内容概括，不要照抄首句。只返回 JSON：{"title":"8到18字的具体名称","category":"2到8字的稳定分类"}。',
+          },
+          { role: 'user', content: kind === 'note' ? `请为以下笔记命名：\n\n${transcript}` : transcript },
+        ],
+      }),
+    });
+    if (!response.ok) return { ok: false, error: `http_${response.status}` };
+    const result = await response.json();
+    const content = result && result.choices && result.choices[0] && result.choices[0].message && result.choices[0].message.content;
+    const metadata = parseSmartMaterialMetadata(content);
+    return metadata && metadata.title ? { ok: true, ...metadata } : { ok: false, error: 'invalid_response' };
+  } catch (error) {
+    return { ok: false, error: error && error.name === 'AbortError' ? 'timeout' : 'request_failed' };
+  } finally {
+    clearTimeout(timeout);
+  }
+});
+
+const WINDOWS_LIST_JXA = `
+ObjC.import('AppKit');
+ObjC.import('CoreGraphics');
+ObjC.import('Foundation');
+function run() {
+  const rows = [];
+  let candidates = 0;
+  let titled = 0;
+  const options = $.kCGWindowListOptionAll | $.kCGWindowListExcludeDesktopElements;
+  const windowList = ObjC.castRefToObject(
+    $.CGWindowListCopyWindowInfo(options, $.kCGNullWindowID)
+  );
+  const appPaths = {};
+  for (let index = 0; index < Number(windowList.count); index++) {
+    const info = windowList.objectAtIndex(index);
+    const get = (key) => ObjC.unwrap(info.objectForKey($(key)));
+    const layer = Number(get('kCGWindowLayer'));
+    const pid = Number(get('kCGWindowOwnerPID'));
+    const appName = String(get('kCGWindowOwnerName') || '').trim();
+    const title = String(get('kCGWindowName') || '').replace(/\\s+/g, ' ').trim();
+    const windowNumber = Number(get('kCGWindowNumber'));
+    // 没有「屏幕录制」权限时 CGWindowList 仍会返回别的应用的窗口，只是 kCGWindowName
+    // 一律为空，系统不报任何错。于是下面这句会把所有行丢掉、列表看起来像「真的没窗口」。
+    // 统计候选数与其中有标题的条数，好让主进程区分这两种情况。
+    if (layer === 0 && pid && appName && windowNumber) {
+      candidates += 1;
+      if (title) titled += 1;
+    }
+    if (layer !== 0 || !pid || !appName || !title || !windowNumber) continue;
+    if (!Object.prototype.hasOwnProperty.call(appPaths, pid)) {
+      const meta = { appPath: '', policy: -1 };
+      try {
+        const runningApp = $.NSRunningApplication.runningApplicationWithProcessIdentifier(pid);
+        if (runningApp && !runningApp.isNil()) {
+          meta.policy = Number(runningApp.activationPolicy);
+          if (runningApp.bundleURL && !runningApp.bundleURL.isNil()) {
+            meta.appPath = String(ObjC.unwrap(runningApp.bundleURL.path) || '');
+          }
+        }
+      } catch (error) {}
+      appPaths[pid] = meta;
+    }
+    const appMeta = appPaths[pid];
+    // activationPolicy 2 = NSApplicationActivationPolicyProhibited：XPC 与系统辅助进程
+    // （如 AuthenticationServicesHelper，bundle 是 .xpc 不是 .app）。它们在系统层面就
+    // 不能被激活，列出来点了也不会有任何反应，属于纯粹的假窗口。
+    // 注意不能用 kCGWindowIsOnscreen 过滤：真实窗口在其他 Space 或被遮挡时该字段也是
+    // nil，实测微信 / Arc / Chrome / 飞书都会被误删。
+    if (appMeta.policy === 2) continue;
+    rows.push({ pid, appName, appPath: appMeta.appPath, title, windowIndex: index, windowNumber });
+  }
+  // candidates 是本可列出的窗口数，titled 是其中拿到标题的数量。
+  // candidates > 0 而 titled === 0 时几乎一定是缺「屏幕录制」权限，不是真的没窗口。
+  return JSON.stringify({ rows: rows, candidates: candidates, titled: titled });
+}`;
+
+const WINDOW_FOCUS_JXA = `
+function run(argv) {
+  const pid = Number(argv[0]);
+  const wantedTitle = String(argv[1] || '');
+  const fallbackIndex = Number(argv[2] || 0);
+  const se = Application('System Events');
+  const matches = se.applicationProcesses.whose({ unixId: pid })();
+  if (!matches.length) return 'false';
+  const process = matches[0];
+  process.frontmost = true;
+  delay(0.08);
+  const windows = process.windows();
+  let target = windows[fallbackIndex];
+  for (let i = 0; i < windows.length; i++) {
+    try {
+      if (String(windows[i].name()) === wantedTitle) { target = windows[i]; break; }
+    } catch (error) {}
+  }
+  if (target) {
+    try { target.actions.byName('AXRaise').perform(); } catch (error) {}
+  }
+  try {
+    const menuBarItems = process.menuBars[0].menuBarItems();
+    let windowMenu = null;
+    for (let i = 0; i < menuBarItems.length; i++) {
+      const name = String(menuBarItems[i].name());
+      if (name === 'Window' || name === '窗口') { windowMenu = menuBarItems[i]; break; }
+    }
+    if (windowMenu) {
+      const items = windowMenu.menus[0].menuItems();
+      for (let i = 0; i < items.length; i++) {
+        if (String(items[i].name()) === wantedTitle) {
+          items[i].click();
+          break;
+        }
+      }
+    }
+  } catch (error) {}
+  return 'true';
+}`;
+
+function runJxa(script, args = []) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      '/usr/bin/osascript',
+      ['-l', 'JavaScript', '-e', script, '--', ...args.map(String)],
+      { timeout: 6000, maxBuffer: 2 * 1024 * 1024 },
+      (error, stdout) => error ? reject(error) : resolve(String(stdout || '').trim())
+    );
+  });
+}
+
+async function scanCurrentWindows() {
+  if (process.platform !== 'darwin') return { items: [], error: 'unsupported' };
+  try {
+    const raw = await runJxa(WINDOWS_LIST_JXA);
+    const parsed = JSON.parse(raw || '{}');
+    // 兼容旧格式（裸数组），新格式是 { rows, candidates, titled }。
+    const payload = Array.isArray(parsed)
+      ? { rows: parsed, candidates: parsed.length, titled: parsed.length }
+      : parsed;
+    const rows = normalizeWindowRows(payload.rows || []).filter((item) => item.pid !== process.pid);
+    // 有候选窗口却一个标题都读不到 = 缺「屏幕录制」权限。macOS 10.15 起读取其他应用的
+    // 窗口标题需要该权限，系统不会报错也不会弹提示，只是静默返回空标题，
+    // 结果界面上只剩一句「没有读取到可切换窗口」，把权限问题伪装成了「真的没窗口」。
+    if (rows.length === 0 && Number(payload.candidates) > 0 && Number(payload.titled) === 0) {
+      windowScanCache = new Map();
+      return { items: [], error: 'screen_recording_permission_required' };
+    }
+    const appPaths = [...new Set(rows.map((item) => item.appPath).filter(Boolean))];
+    await Promise.all(appPaths.map(async (appPath) => {
+      if (windowIconCache.has(appPath)) return;
+      const icon = await withTimeout(readWindowAppIcon(appPath), 3500, null);
+      windowIconCache.set(appPath, icon);
+    }));
+    rows.forEach((item) => {
+      item.icon = item.appPath ? windowIconCache.get(item.appPath) || null : null;
+    });
+    windowScanCache = new Map(rows.map((item) => [item.id, item]));
+    return { items: rows, error: null };
+  } catch (error) {
+    windowScanCache = new Map();
+    return { items: [], error: 'accessibility_permission_required' };
+  }
+}
+
+ipcMain.handle('windows:list', async () => {
+  return scanCurrentWindows();
+});
+
+ipcMain.handle('windows:focus', async (event, windowId) => {
+  const target = windowScanCache.get(windowId);
+  if (!target || process.platform !== 'darwin') return false;
+  try {
+    return (await runJxa(WINDOW_FOCUS_JXA, [target.pid, target.title, target.windowIndex])) === 'true';
+  } catch (error) {
+    return false;
+  }
+});
+
+function taskWindowMatchScore(notification, target) {
+  const project = String(notification && notification.project || '').trim().toLocaleLowerCase();
+  const title = String(target && target.title || '').trim().toLocaleLowerCase();
+  const appName = String(target && target.appName || '').trim().toLocaleLowerCase();
+  if (!project || !title) return 0;
+  if (title === project) return 100;
+  if (title.startsWith(`${project} `) || title.startsWith(`${project} —`) || title.startsWith(`${project} -`)) return 90;
+  if (title.includes(project)) return 75;
+  if (project.includes(appName) && appName) return 25;
+  return 0;
+}
+
+async function activateActiveTaskNotification(eventId = null) {
+  const notification = activeTaskNotification;
+  if (!notification || (eventId && notification.eventId !== eventId) || notification.source === 'todo') return false;
+  const result = await scanCurrentWindows();
+  const target = (result.items || [])
+    .map((item) => ({ item, score: taskWindowMatchScore(notification, item) }))
+    .filter((candidate) => candidate.score > 0)
+    .sort((a, b) => b.score - a.score)[0]?.item;
+  if (!target) return false;
+  try {
+    const focused = (await runJxa(WINDOW_FOCUS_JXA, [target.pid, target.title, target.windowIndex])) === 'true';
+    if (focused) beginTaskNotificationDismiss();
+    return focused;
+  } catch (error) {
+    return false;
+  }
+}
+
+ipcMain.handle('task-notification:activate', async (event, eventId) => {
+  if (!islandWindow || islandWindow.isDestroyed() || event.sender !== islandWindow.webContents) return false;
+  return activateActiveTaskNotification(eventId);
+});
+
+// 当前窗口模块仍需要安全读取本机应用图标。
+// 优先直接从 .icns 提取内嵌 PNG；失败时通过独立 JXA 进程向 NSWorkspace 取系统图标。
+// 不直接调用 app.getFileIcon：它曾在部分 .app 上触发 Electron 内部 FATAL Check，
+// 独立进程即使失败也不会带崩主进程。
+const PNG_SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+// icns 内 PNG 块按"贴近 48px 网格展示"优先：128 → 256 → 64@2x …
+const ICNS_PREF = ['ic07', 'ic12', 'ic08', 'ic11', 'ic13', 'ic09', 'ic14', 'ic05', 'ic04'];
+
+function extractPngFromIcns(buf) {
+  if (buf.length < 8 || buf.toString('ascii', 0, 4) !== 'icns') return null;
+  const candidates = [];
+  let off = 8;
+  while (off + 8 <= buf.length) {
+    const type = buf.toString('ascii', off, off + 4);
+    const len = buf.readUInt32BE(off + 4);
+    if (len < 8 || off + len > buf.length) break;
+    const data = buf.subarray(off + 8, off + len);
+    if (data.length > 8 && data.subarray(0, 4).equals(PNG_SIG)) {
+      candidates.push({ type, data });
+    }
+    off += len;
+  }
+  if (!candidates.length) return null; // 老式 RLE 图标 → 交给渲染层首字母兜底
+  candidates.sort((a, b) => {
+    const ia = ICNS_PREF.indexOf(a.type);
+    const ib = ICNS_PREF.indexOf(b.type);
+    return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
+  });
+  return candidates[0].data;
+}
+
+async function readEmbeddedAppIcon(appPath) {
+  try {
+    const resDir = path.join(appPath, 'Contents', 'Resources');
+    const files = await fs.promises.readdir(resDir);
+    const icns = files.filter((f) => f.toLowerCase().endsWith('.icns'));
+    if (!icns.length) return null;
+    // 优先 AppIcon.icns，其次名字含 app/icon 的，避免选中文档类型图标
+    const score = (n) => {
+      const s = n.toLowerCase();
+      if (s === 'appicon.icns') return 0;
+      if (s.includes('app')) return 1;
+      if (s.includes('icon')) return 2;
+      return 3;
+    };
+    icns.sort((a, b) => score(a) - score(b) || a.length - b.length);
+    const buf = await fs.promises.readFile(path.join(resDir, icns[0]));
+    const png = extractPngFromIcns(buf);
+    return png ? `data:image/png;base64,${png.toString('base64')}` : null;
+  } catch (e) {
+    return null; // 单个应用读不到图标不影响整体
+  }
+}
+
+const SYSTEM_ICON_JXA = `
+ObjC.import('AppKit');
+function run(argv) {
+  const size = 96;
+  const source = $.NSWorkspace.sharedWorkspace.iconForFile(argv[0]);
+  const image = $.NSImage.alloc.initWithSize($.NSMakeSize(size, size));
+  image.lockFocus;
+  source.drawInRectFromRectOperationFraction(
+    $.NSMakeRect(0, 0, size, size),
+    $.NSZeroRect,
+    $.NSCompositingOperationSourceOver,
+    1
+  );
+  image.unlockFocus;
+  const rep = $.NSBitmapImageRep.imageRepWithData(image.TIFFRepresentation);
+  const data = rep.representationUsingTypeProperties($.NSBitmapImageFileTypePNG, $({}));
+  return ObjC.unwrap(data.base64EncodedStringWithOptions(0));
+}`;
+
+function readSystemAppIconNow(appPath) {
+  return new Promise((resolve) => {
+    execFile(
+      '/usr/bin/osascript',
+      ['-l', 'JavaScript', '-e', SYSTEM_ICON_JXA, appPath],
+      { timeout: 4000, maxBuffer: 2 * 1024 * 1024 },
+      (error, stdout) => {
+        const base64 = typeof stdout === 'string' ? stdout.trim() : '';
+        if (error || !base64 || !/^[A-Za-z0-9+/=]+$/.test(base64)) {
+          resolve(null);
+          return;
+        }
+        resolve(`data:image/png;base64,${base64}`);
+      }
+    );
+  });
+}
+
+const SYSTEM_ICON_CONCURRENCY = 2;
+const SYSTEM_ICON_QUEUE_TIMEOUT_MS = 10000;
+let systemIconActive = 0;
+const systemIconQueue = [];
+
+function pumpSystemIconQueue() {
+  while (systemIconActive < SYSTEM_ICON_CONCURRENCY && systemIconQueue.length) {
+    const job = systemIconQueue.shift();
+    if (job.cancelled) continue;
+    systemIconActive++;
+    readSystemAppIconNow(job.appPath)
+      .then(job.finish, () => job.finish(null))
+      .finally(() => {
+        systemIconActive--;
+        pumpSystemIconQueue();
+      });
+  }
+}
+
+function readSystemAppIcon(appPath) {
+  if (process.platform !== 'darwin') return Promise.resolve(null);
+  return new Promise((resolve) => {
+    const job = {
+      appPath,
+      cancelled: false,
+      settled: false,
+      timer: null,
+      finish(value) {
+        if (job.settled) return;
+        job.settled = true;
+        if (job.timer) clearTimeout(job.timer);
+        resolve(value);
+      },
+    };
+    job.timer = setTimeout(() => {
+      job.cancelled = true;
+      job.finish(null);
+    }, SYSTEM_ICON_QUEUE_TIMEOUT_MS);
+    systemIconQueue.push(job);
+    pumpSystemIconQueue();
+  });
+}
+
+async function readWindowAppIcon(appPath) {
+  const systemIcon = await withTimeout(readSystemAppIcon(appPath), 2800, null);
+  return systemIcon || readEmbeddedAppIcon(appPath);
+}
+
+function withTimeout(promise, ms, fallback) {
+  return Promise.race([
+    promise,
+    new Promise((resolve) => setTimeout(() => resolve(fallback), ms)),
+  ]);
+}
+
+const FRONTMOST_APP_JXA = `
+ObjC.import('AppKit');
+function run() {
+  const app = $.NSWorkspace.sharedWorkspace.frontmostApplication;
+  if (!app) return '{}';
+  return JSON.stringify({
+    name: ObjC.unwrap(app.localizedName) || '',
+    bundleId: ObjC.unwrap(app.bundleIdentifier) || '',
+    path: app.bundleURL ? (ObjC.unwrap(app.bundleURL.path) || '') : ''
+  });
+}`;
+
+const PASTE_TO_APP_JXA = `
+ObjC.import('AppKit');
+function run(argv) {
+  const bundleId = String(argv[0] || '');
+  if (!bundleId) return 'missing';
+  const apps = $.NSRunningApplication.runningApplicationsWithBundleIdentifier(bundleId);
+  if (!apps || apps.count === 0) return 'missing';
+  apps.objectAtIndex(0).activateWithOptions($.NSApplicationActivateIgnoringOtherApps);
+  delay(0.18);
+  Application('System Events').keystroke('v', { using: 'command down' });
+  return 'ok';
+}`;
+
+function readFrontmostApp() {
+  if (!PLATFORM_CAPABILITIES.automaticPaste) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    execFile('/usr/bin/osascript', ['-l', 'JavaScript', '-e', FRONTMOST_APP_JXA], { timeout: 2200 }, (error, stdout) => {
+      if (error) return resolve(null);
+      try {
+        const value = JSON.parse(String(stdout || '').trim());
+        resolve(value && value.path ? value : null);
+      } catch (parseError) {
+        resolve(null);
+      }
+    });
+  });
+}
+
+async function rememberPasteTarget() {
+  const current = await readFrontmostApp();
+  if (current && !['com.github.Electron', 'com.vibecoding.notch-todo', 'com.dynamicpanel.app'].includes(current.bundleId)) {
+    previousPasteTarget = current;
+  }
+  return previousPasteTarget;
+}
+
+ipcMain.handle('mirror:get-image', () => mirrorImageDataUrl());
+ipcMain.handle('mirror:choose-image', () => chooseMirrorImage());
+
+function getCredentialsVaultPath() {
+  return path.join(app.getPath('userData'), CREDENTIALS_VAULT_FILE);
+}
+
+function readCredentialsVault() {
+  if (!safeStorage.isEncryptionAvailable()) return [];
+  try {
+    const envelope = JSON.parse(fs.readFileSync(getCredentialsVaultPath(), 'utf8'));
+    const decoded = safeStorage.decryptString(Buffer.from(String(envelope.payload || ''), 'base64'));
+    const rows = JSON.parse(decoded);
+    return Array.isArray(rows) ? rows.map((item) => normalizeCredentialInput(item, item && item.id, item && item.createdAt)).filter(Boolean) : [];
+  } catch (error) {
+    return [];
+  }
+}
+
+function writeCredentialsVault(rows) {
+  if (!safeStorage.isEncryptionAvailable()) return false;
+  const payload = safeStorage.encryptString(JSON.stringify(rows)).toString('base64');
+  const vaultPath = getCredentialsVaultPath();
+  const temporaryPath = `${vaultPath}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(temporaryPath, JSON.stringify({ version: 1, payload }), { mode: 0o600 });
+    fs.renameSync(temporaryPath, vaultPath);
+    return true;
+  } catch (error) {
+    try { fs.unlinkSync(temporaryPath); } catch (unlinkError) {}
+    return false;
+  }
+}
+
+function publicCredential(item) {
+  return {
+    id: item.id,
+    service: item.service,
+    account: item.account,
+    passwordMask: '**********',
+    createdAt: item.createdAt,
+  };
+}
+
+ipcMain.handle('credentials:list', () => ({
+  ok: safeStorage.isEncryptionAvailable(),
+  secureStorage: safeStorage.isEncryptionAvailable(),
+  items: readCredentialsVault().map(publicCredential),
+}));
+
+ipcMain.handle('credentials:get', (event, id) => {
+  const item = readCredentialsVault().find((row) => row.id === String(id || ''));
+  return item ? { ok: true, item: { ...item } } : { ok: false, error: 'not_found' };
+});
+
+ipcMain.handle('credentials:save', (event, payload) => {
+  if (!safeStorage.isEncryptionAvailable()) return { ok: false, error: 'secure_storage_unavailable' };
+  const rows = readCredentialsVault();
+  const existing = payload && payload.id ? rows.find((item) => item.id === payload.id) : null;
+  const normalized = normalizeCredentialInput(
+    existing && !String(payload && payload.password || '') ? { ...payload, password: existing.password } : payload,
+    existing ? existing.id : crypto.randomUUID(),
+    existing ? existing.createdAt : Date.now()
+  );
+  if (!normalized) return { ok: false, error: 'invalid_credential' };
+  const next = existing
+    ? rows.map((item) => item.id === existing.id ? normalized : item)
+    : [normalized, ...rows];
+  return writeCredentialsVault(next)
+    ? { ok: true, item: publicCredential(normalized) }
+    : { ok: false, error: 'save_failed' };
+});
+
+ipcMain.handle('credentials:delete-many', (event, ids) => {
+  const targets = new Set(Array.isArray(ids) ? ids.map(String) : []);
+  if (!targets.size) return { ok: true, deleted: 0 };
+  const rows = readCredentialsVault();
+  const next = rows.filter((item) => !targets.has(item.id));
+  if (!writeCredentialsVault(next)) return { ok: false, error: 'save_failed' };
+  return { ok: true, deleted: rows.length - next.length };
+});
+
+ipcMain.handle('credentials:copy', async (event, payload) => {
+  const id = String(payload && payload.id || '');
+  const field = payload && payload.field === 'password' ? 'password' : payload && payload.field === 'account' ? 'account' : '';
+  if (!id || !field) return false;
+  const item = readCredentialsVault().find((row) => row.id === id);
+  if (!item) return false;
+  const value = item[field];
+  await clipboard.writeText(value);
+  if (field === 'password') {
+    setTimeout(() => {
+      void clipboard.readText()
+        .then((currentValue) => {
+          if (currentValue === value) return clipboard.clear();
+          return undefined;
+        })
+        .catch(() => {});
+    }, 60_000).unref?.();
+  }
+  return true;
+});
+
+const SODA_SHORTCUT_JXA = `
+function run(argv) {
+  const keyCode = Number(argv[0]);
+  const usesCommand = String(argv[1] || '') === '1';
+  const dismissOverlays = String(argv[2] || '') === '1';
+  const processes = Application('System Events').applicationProcesses.whose({ bundleIdentifier: 'com.soda.music' })();
+  if (!processes.length) return 'missing';
+  processes[0].frontmost = true;
+  delay(0.35);
+  const systemEvents = Application('System Events');
+  if (!Number.isFinite(keyCode)) return 'invalid';
+  if (dismissOverlays) {
+    systemEvents.keyCode(53);
+    delay(0.15);
+  }
+  if (usesCommand) systemEvents.keyCode(keyCode, { using: 'command down' });
+  else systemEvents.keyCode(keyCode);
+  return 'ok';
+}`;
+
+async function sendSodaShortcut(action) {
+  if (process.platform !== 'darwin') return { ok: false, error: 'unsupported' };
+  if (!systemPreferences.isTrustedAccessibilityClient(false)) {
+    return { ok: false, error: 'accessibility_permission_required' };
+  }
+  const shortcut = sodaShortcutSpec(action);
+  if (!shortcut) return { ok: false, error: 'invalid_action' };
+  try {
+    const result = await runJxa(SODA_SHORTCUT_JXA, [
+      shortcut.keyCode,
+      shortcut.command ? '1' : '0',
+      shortcut.dismissOverlays ? '1' : '0',
+    ]);
+    return result === 'ok' ? { ok: true } : { ok: false, error: 'soda_control_failed' };
+  } catch (error) {
+    console.warn('[music] failed to send Soda Music shortcut', error && error.message || error);
+    return { ok: false, error: 'soda_control_failed' };
+  }
+}
+
+// ============ 音乐播放器 ============
+// 识别、选择与控制策略见 main/music-players.js；这里只负责把它接到设置、权限与窗口上。
+const musicPlayers = createMusicPlayers({ execFile, runJxa });
+const musicPlayingById = new Map(); // 读不到真实状态的播放器：记住上一次操作后的乐观状态
+const musicIconCache = new Map(); // appPath -> Promise<dataUrl|null>
+let musicChoices = []; // 最近一次扫描到的已安装播放器，供托盘菜单同步读取
+
+function readMusicIcon(player) {
+  if (!musicIconCache.has(player.appPath)) {
+    musicIconCache.set(player.appPath, readSystemAppIconNow(player.appPath).then((icon) => {
+      if (!icon) musicIconCache.delete(player.appPath); // 读失败不缓存，下次再试
+      return icon;
+    }));
+  }
+  return musicIconCache.get(player.appPath);
+}
+
+function rememberMusicChoices(installed) {
+  const next = installed.map((player) => ({ id: player.id, name: player.name }));
+  const changed = JSON.stringify(next) !== JSON.stringify(musicChoices);
+  musicChoices = next;
+  if (changed) refreshTrayMenu();
+}
+
+// AppleScript 控制第一次会触发系统的「自动化」授权框。面板在 screen-saver 层会把它压在下面，
+// 所以首次调用期间临时降层，并挡住这期间的失焦收起。
+async function runBelowSystemPrompts(task) {
+  const targetWindow = mainWindow;
+  const restore = Boolean(targetWindow && !targetWindow.isDestroyed() && targetWindow.isAlwaysOnTop());
+  transientSystemInteractionRequests += 1;
+  if (restore) targetWindow.setAlwaysOnTop(false);
+  try {
+    return await task();
+  } finally {
+    if (restore && !targetWindow.isDestroyed()) applyPanelWindowLevel();
+    transientSystemInteractionRequests = Math.max(0, transientSystemInteractionRequests - 1);
+  }
+}
+
+async function buildMusicStatus(scriptStatus = null) {
+  if (process.platform !== 'darwin') {
+    return { supported: false, installed: false, running: false, sessionActive: false, playing: false, name: '', title: '', artist: '', icon: null, choices: [] };
+  }
+  const settings = readAppSettings();
+  const { installed, player, running } = await musicPlayers.resolve(settings.musicPlayer);
+  rememberMusicChoices(installed);
+  const base = {
+    supported: true,
+    preference: settings.musicPlayer,
+    choices: musicChoices,
+  };
+  if (!player) {
+    return { ...base, installed: false, running: false, sessionActive: false, playing: false, playerId: '', name: '', title: '', artist: '', icon: null };
+  }
+  if (!running) musicPlayingById.delete(player.id);
+  let playing = running && musicPlayingById.get(player.id) === true;
+  let title = '';
+  let artist = '';
+  // 只有用户曾经成功控制过（即已授予自动化权限）才主动读状态，否则启动时就会弹系统授权框。
+  let status = scriptStatus;
+  if (!status && running && player.strategy === 'script' && settings.musicAutomation.includes(player.id)) {
+    status = await musicPlayers.readScriptStatus(player);
+  }
+  if (status && status.running) {
+    playing = status.playing;
+    title = status.title;
+    artist = status.artist;
+    musicPlayingById.set(player.id, playing);
+  }
+  return {
+    ...base,
+    installed: true,
+    playerId: player.id,
+    name: player.name,
+    running,
+    sessionActive: running,
+    playing,
+    title,
+    artist,
+    icon: await readMusicIcon(player),
+  };
+}
+
+ipcMain.handle('music:status', () => buildMusicStatus());
+
+ipcMain.handle('music:control', async (event, action) => {
+  if (process.platform !== 'darwin') return { ok: false, error: 'unsupported' };
+  const settings = readAppSettings();
+  const { player } = await musicPlayers.resolve(settings.musicPlayer);
+  if (!player) return { ok: false, error: 'not_installed' };
+
+  let scriptStatus = null;
+  const sendShortcut = async (requested) => {
+    if (player.strategy === 'script') {
+      const firstTime = !settings.musicAutomation.includes(player.id);
+      const send = () => musicPlayers.sendScriptCommand(player, requested);
+      const sent = firstTime ? await runBelowSystemPrompts(send) : await send();
+      if (sent.ok) {
+        scriptStatus = sent.status;
+        if (firstTime) {
+          const next = readAppSettings();
+          next.musicAutomation = [...new Set([...next.musicAutomation, player.id])];
+          saveAppSettings(next);
+        }
+      }
+      return sent;
+    }
+    // 发按键 / 媒体键都需要「辅助功能」。缺权限时打开自己的权限窗口，
+    // 不再调系统的授权提示——那个提示会被别的窗口盖住。
+    if (!systemPreferences.isTrustedAccessibilityClient(false)) {
+      openPermissionsWindow();
+      return { ok: false, error: 'accessibility_permission_required' };
+    }
+    return player.strategy === 'soda-keys' ? sendSodaShortcut(requested) : musicPlayers.sendMediaKey(requested);
+  };
+
+  const result = await controlSodaMusic(action, {
+    isRunning: () => musicPlayers.isRunning(player),
+    launch: () => musicPlayers.launch(player),
+    sendShortcut,
+  }, musicPlayingById.get(player.id) === true);
+  if (result && result.ok) {
+    if (scriptStatus) result.playing = scriptStatus.playing;
+    musicPlayingById.set(player.id, result.playing);
+  }
+  // 汽水音乐的方案要先把它切到前台，发完按键再把面板拿回来；其余策略不抢焦点。
+  if (
+    result && result.ok && player.strategy === 'soda-keys'
+    && mainWindow && !mainWindow.isDestroyed() && currentMode === 'expanded'
+  ) {
+    if (!mainWindow.isVisible()) mainWindow.show();
+    mainWindow.focus();
+  }
+  return { ...result, status: await buildMusicStatus(scriptStatus) };
+});
+
+function setMusicPreference(preference) {
+  const next = readAppSettings();
+  next.musicPlayer = normalizeMusicPreference(preference);
+  saveAppSettings(next);
+  refreshTrayMenu();
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('music:changed');
+}
+
+function musicMenuItems(preference) {
+  return [
+    { label: '自动选择', type: 'radio', checked: preference === 'auto', click: () => setMusicPreference('auto') },
+    ...musicChoices.map((choice) => ({
+      label: choice.name,
+      type: 'radio',
+      checked: preference === choice.id,
+      click: () => setMusicPreference(choice.id),
+    })),
+  ];
+}
+
+// 点音乐组件的标题弹出原生菜单切换播放器。
+ipcMain.handle('music:choose', async (event) => {
+  if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) return false;
+  rememberMusicChoices(await musicPlayers.listInstalled(true));
+  if (musicChoices.length === 0) return false;
+  transientSystemInteractionRequests += 1;
+  Menu.buildFromTemplate(musicMenuItems(readAppSettings().musicPlayer)).popup({
+    window: mainWindow,
+    callback: () => {
+      transientSystemInteractionRequests = Math.max(0, transientSystemInteractionRequests - 1);
+    },
+  });
+  return true;
+});
+
+
+// ============ 百炼实时语音转写 ============
+function getTranscriptionSettingsPath() {
+  return path.join(app.getPath('userData'), TRANSCRIPTION_SETTINGS_FILE);
+}
+
+function readStoredTranscriptionSettings() {
+  const currentPath = getTranscriptionSettingsPath();
+  const legacyPath = path.join(app.getPath('appData'), 'notch-todo', TRANSCRIPTION_SETTINGS_FILE);
+  const readSettings = (settingsPath) => {
+    try {
+      const value = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+      return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+    } catch (error) {
+      return {};
+    }
+  };
+  const current = readSettings(currentPath);
+  const legacy = currentPath === legacyPath ? {} : readSettings(legacyPath);
+  const selected = selectTranscriptionSettings(current, legacy);
+  if (!Object.keys(current).length && Object.keys(selected).length && currentPath !== legacyPath) {
+    try {
+      fs.mkdirSync(path.dirname(currentPath), { recursive: true });
+      fs.writeFileSync(currentPath, JSON.stringify(selected), { mode: 0o600 });
+    } catch (error) {
+      // 迁移失败时仍从旧目录读取，避免已有密钥突然失效。
+    }
+  }
+  return selected;
+}
+
+function decryptStoredApiKey(settings) {
+  const environmentKey = String(process.env.DASHSCOPE_API_KEY || '').trim();
+  if (environmentKey) return environmentKey;
+  return decryptStoredSecret(settings.encryptedApiKey).trim();
+}
+
+function decryptStoredSecret(value) {
+  if (!value || !safeStorage.isEncryptionAvailable()) return '';
+  try {
+    return safeStorage.decryptString(Buffer.from(String(value), 'base64'));
+  } catch (error) {
+    return '';
+  }
+}
+
+function resolveLlmConfig() {
+  const settings = readStoredTranscriptionSettings();
+  return {
+    apiKey: String(process.env.NOTCH_LLM_API_KEY || decryptStoredSecret(settings.encryptedLlmApiKey)).trim(),
+    baseUrl: String(settings.llmBaseUrl || 'https://api.deepseek.com').trim(),
+    model: String(settings.llmModel || 'deepseek-v4-flash').trim(),
+  };
+}
+
+function resolveTranscriptionConfig() {
+  const settings = readStoredTranscriptionSettings();
+  const environmentWorkspace = String(process.env.DASHSCOPE_WORKSPACE_ID || process.env.DASHSCOPE_WORKSPACE || '').trim();
+  const environmentRegion = String(process.env.DASHSCOPE_REGION || '').trim().toLowerCase();
+  const region = ['beijing', 'singapore'].includes(environmentRegion)
+    ? environmentRegion
+    : ['beijing', 'singapore'].includes(settings.region) ? settings.region : 'beijing';
+  const workspaceId = (environmentWorkspace || String(settings.workspaceId || '').trim()).slice(0, 128);
+  return {
+    apiKey: decryptStoredApiKey(settings),
+    workspaceId: /^[A-Za-z0-9_-]{0,128}$/.test(workspaceId) ? workspaceId : '',
+    region,
+  };
+}
+
+function publicTranscriptionConfig() {
+  const config = resolveTranscriptionConfig();
+  const llmConfig = resolveLlmConfig();
+  const settings = readStoredTranscriptionSettings();
+  return {
+    configured: Boolean(config.apiKey),
+    asrNeedsReentry: Boolean(settings.encryptedApiKey && !config.apiKey),
+    workspaceId: config.workspaceId,
+    region: config.region,
+    provider: 'qwen3-asr-flash-realtime',
+    secureStorage: safeStorage.isEncryptionAvailable(),
+    llmConfigured: Boolean(llmConfig.apiKey),
+    llmNeedsReentry: Boolean(settings.encryptedLlmApiKey && !llmConfig.apiKey),
+    llmBaseUrl: String(settings.llmBaseUrl || 'https://api.deepseek.com'),
+    llmModel: String(settings.llmModel || 'deepseek-v4-flash'),
+  };
+}
+
+function transcriptionUrl(config) {
+  const host = config.workspaceId
+    ? config.region === 'singapore'
+      ? `${config.workspaceId}.ap-southeast-1.maas.aliyuncs.com`
+      : `${config.workspaceId}.cn-beijing.maas.aliyuncs.com`
+    : config.region === 'singapore'
+      ? 'dashscope-intl.aliyuncs.com'
+      : 'dashscope.aliyuncs.com';
+  return `wss://${host}/api-ws/v1/realtime?model=${TRANSCRIPTION_MODEL}&heartbeat=true`;
+}
+
+function transcriptionEventId() {
+  return `event_${crypto.randomUUID().replace(/-/g, '')}`;
+}
+
+function emitTranscription(session, payload) {
+  if (session.sender && !session.sender.isDestroyed()) {
+    session.sender.send('transcription:event', payload);
+  }
+}
+
+function sessionTranscript(session) {
+  return [...session.finalSegments, session.interim].filter(Boolean).join(' ').trim();
+}
+
+function closeTranscriptionSession(session, result = {}) {
+  if (!session || session.closed) return;
+  session.closed = true;
+  clearTimeout(session.connectTimer);
+  clearTimeout(session.finishTimer);
+  clearTimeout(session.retryTimer);
+  clearTimeout(session.heartbeatTimer);
+  if (transcriptionSessions.get(session.senderId) === session) transcriptionSessions.delete(session.senderId);
+  session.settleStart?.({ ok: false, error: result.error || 'connection_closed' });
+  session.audioQueue = [];
+  try { session.socket?.terminate(); } catch (error) {}
+  if (session.finishResolve) {
+    session.finishResolve({
+      ok: result.ok !== false,
+      transcript: sessionTranscript(session),
+      error: result.error || null,
+    });
+    session.finishResolve = null;
+  }
+}
+
+function handleTranscriptionMessage(session, raw) {
+  let message;
+  try { message = JSON.parse(String(raw)); } catch (error) { return; }
+  if (message.type === 'session.updated') {
+    session.ready = true;
+    session.retryCount = 0;
+    session.lastError = '';
+    clearTimeout(session.connectTimer);
+    session.settleStart({ ok: true });
+    emitTranscription(session, { type: 'status', status: 'connected' });
+    flushTranscriptionAudio(session);
+    return;
+  }
+  if (message.type === 'conversation.item.input_audio_transcription.text') {
+    session.interim = `${String(message.text || '').trim()}${String(message.stash || '').trim()}`;
+    emitTranscription(session, {
+      type: 'transcript',
+      final: session.finalSegments.join(' ').trim(),
+      interim: session.interim,
+    });
+    return;
+  }
+  if (message.type === 'conversation.item.input_audio_transcription.completed') {
+    const transcript = String(message.transcript || '').trim();
+    if (transcript && (!message.item_id || !session.completedItems.has(message.item_id))) {
+      session.finalSegments.push(transcript);
+      if (message.item_id) session.completedItems.add(message.item_id);
+    }
+    session.interim = '';
+    emitTranscription(session, {
+      type: 'transcript',
+      final: session.finalSegments.join(' ').trim(),
+      interim: '',
+    });
+    return;
+  }
+  if (message.type === 'error' || message.type === 'conversation.item.input_audio_transcription.failed') {
+    const details = message.error && message.error.message || '实时转写服务返回错误';
+    reconnectTranscription(session, details);
+    return;
+  }
+  if (message.type === 'session.finished') {
+    if (session.finishResolve) closeTranscriptionSession(session, { ok: !session.audioGap, error: session.audioGap ? 'audio_gap' : null });
+    else reconnectTranscription(session, 'session_finished');
+  }
+}
+
+function reconnectTranscription(session, error) {
+  if (session.closed || session.retryTimer) return;
+  session.lastError = error;
+  session.ready = false;
+  clearTimeout(session.connectTimer);
+  clearTimeout(session.heartbeatTimer);
+  const socket = session.socket;
+  session.socket = null; // Ignore late close/error/transcript events from the old connection.
+  try { socket?.terminate(); } catch (ignored) {}
+  if (session.finishResolve) {
+    closeTranscriptionSession(session, { ok: false, error });
+    return;
+  }
+  // Preserve the last partial sentence when the server can no longer finalize it.
+  if (session.interim) session.finalSegments.push(session.interim);
+  session.interim = '';
+  emitTranscription(session, { type: 'transcript', final: sessionTranscript(session), interim: '' });
+  if (session.retryCount >= 5) {
+    emitTranscription(session, { type: 'error', message: error });
+    closeTranscriptionSession(session, { ok: false, error });
+    return;
+  }
+  emitTranscription(session, { type: 'status', status: 'reconnecting' });
+  const delay = Math.min(1000 * 2 ** session.retryCount++, 15000);
+  session.retryTimer = setTimeout(() => {
+    session.retryTimer = null;
+    connectTranscriptionSocket(session);
+  }, delay);
+}
+
+function flushTranscriptionAudio(session) {
+  while (session.ready && session.socket?.readyState === WebSocket.OPEN && session.audioQueue.length) {
+    const buffer = session.audioQueue[0];
+    // Bound ws's own outgoing queue as well as our reconnect buffer.
+    if (session.socket.bufferedAmount > 16000 * 2 * 30) {
+      reconnectTranscription(session, 'audio_backpressure');
+      return;
+    }
+    try {
+      session.socket.send(JSON.stringify({
+        event_id: transcriptionEventId(), type: 'input_audio_buffer.append', audio: buffer.toString('base64'),
+      }));
+    } catch (error) {
+      reconnectTranscription(session, 'audio_send_failed');
+      return;
+    }
+    session.audioQueue.shift();
+    session.queuedBytes -= buffer.length;
+  }
+}
+
+function connectTranscriptionSocket(session) {
+  if (session.closed) return;
+  const socket = new WebSocket(transcriptionUrl(session.config), { headers: session.headers });
+  session.socket = socket;
+  session.completedItems = new Set();
+  const active = () => !session.closed && session.socket === socket;
+  session.connectTimer = setTimeout(() => {
+    if (active()) reconnectTranscription(session, 'connect_timeout');
+  }, 8000);
+  socket.on('open', () => {
+    if (!active()) return;
+    try {
+      socket.send(JSON.stringify({
+        event_id: transcriptionEventId(), type: 'session.update',
+        session: {
+          input_audio_format: 'pcm', sample_rate: TRANSCRIPTION_SAMPLE_RATE,
+          input_audio_transcription: { language: 'zh' },
+          turn_detection: { type: 'server_vad', threshold: 0, silence_duration_ms: 400 },
+        },
+      }));
+    } catch (error) { reconnectTranscription(session, 'configuration_send_failed'); return; }
+    let awaitingPong = false;
+    socket.on('pong', () => { awaitingPong = false; });
+    const heartbeat = () => {
+      if (!active()) return;
+      if (awaitingPong) { reconnectTranscription(session, 'heartbeat_timeout'); return; }
+      awaitingPong = true;
+      try { socket.ping(); } catch (error) { reconnectTranscription(session, 'heartbeat_failed'); return; }
+      session.heartbeatTimer = setTimeout(heartbeat, 15000);
+    };
+    session.heartbeatTimer = setTimeout(heartbeat, 15000);
+  });
+  socket.on('message', (data) => { if (active()) handleTranscriptionMessage(session, data); });
+  socket.on('error', (error) => {
+    if (active()) reconnectTranscription(session, String(error?.message || 'connection_failed'));
+  });
+  socket.on('close', (code) => {
+    if (active()) reconnectTranscription(session, `connection_closed_${code}`);
+  });
+}
+
+ipcMain.handle('transcription:get-config', () => publicTranscriptionConfig());
+
+ipcMain.handle('transcription:set-config', (event, payload) => {
+  const previous = readStoredTranscriptionSettings();
+  const region = payload && payload.region === 'singapore' ? 'singapore' : 'beijing';
+  const workspaceId = String(payload && payload.workspaceId || '').trim();
+  const apiKey = String(payload && payload.apiKey || '').trim();
+  const llmApiKey = String(payload && payload.llmApiKey || '').trim();
+  const llmBaseUrl = String(payload && payload.llmBaseUrl || previous.llmBaseUrl || 'https://api.deepseek.com').trim();
+  const llmModel = String(payload && payload.llmModel || previous.llmModel || 'deepseek-v4-flash').replace(/\s+/g, ' ').trim().slice(0, 120);
+  if (workspaceId && !/^[A-Za-z0-9_-]{1,128}$/.test(workspaceId)) {
+    return { ok: false, error: 'invalid_workspace' };
+  }
+  let parsedLlmUrl;
+  try { parsedLlmUrl = new URL(llmBaseUrl); } catch (error) { parsedLlmUrl = null; }
+  if (!parsedLlmUrl || parsedLlmUrl.protocol !== 'https:' || parsedLlmUrl.username || parsedLlmUrl.password) {
+    return { ok: false, error: 'invalid_llm_url' };
+  }
+  if ((apiKey || llmApiKey) && !safeStorage.isEncryptionAvailable()) {
+    return { ok: false, error: 'secure_storage_unavailable' };
+  }
+  const next = {
+    region,
+    workspaceId,
+    encryptedApiKey: apiKey
+      ? safeStorage.encryptString(apiKey).toString('base64')
+      : String(previous.encryptedApiKey || ''),
+    llmBaseUrl: parsedLlmUrl.toString().replace(/\/$/, ''),
+    llmModel,
+    encryptedLlmApiKey: llmApiKey
+      ? safeStorage.encryptString(llmApiKey).toString('base64')
+      : String(previous.encryptedLlmApiKey || ''),
+  };
+  try {
+    fs.writeFileSync(getTranscriptionSettingsPath(), JSON.stringify(next), { mode: 0o600 });
+    return { ok: true, ...publicTranscriptionConfig() };
+  } catch (error) {
+    return { ok: false, error: 'save_failed' };
+  }
+});
+
+ipcMain.handle('transcription:start', (event) => {
+  const config = resolveTranscriptionConfig();
+  if (!config.apiKey) return { ok: false, error: 'not_configured' };
+  const existing = transcriptionSessions.get(event.sender.id);
+  if (existing) closeTranscriptionSession(existing, { ok: false, error: 'replaced' });
+  return new Promise((resolve) => {
+    const headers = {
+      Authorization: `Bearer ${config.apiKey}`,
+      'OpenAI-Beta': 'realtime=v1',
+      'User-Agent': 'DynamicPanel/0.3',
+    };
+    if (config.workspaceId) headers['X-DashScope-WorkSpace'] = config.workspaceId;
+    const session = {
+      sender: event.sender, senderId: event.sender.id, config, headers,
+      socket: null, finalSegments: [], interim: '', ready: false, closed: false,
+      startSettled: false, finishResolve: null, connectTimer: null, finishTimer: null,
+      retryTimer: null, heartbeatTimer: null, retryCount: 0, lastError: '',
+      audioQueue: [], queuedBytes: 0, audioGap: false, completedItems: new Set(),
+    };
+    transcriptionSessions.set(event.sender.id, session);
+    session.settleStart = (result) => {
+      if (session.startSettled) return;
+      session.startSettled = true;
+      resolve(result);
+    };
+    connectTranscriptionSocket(session);
+  });
+});
+
+ipcMain.on('transcription:audio', (event, bytes) => {
+  const session = transcriptionSessions.get(event.sender.id);
+  if (!session || session.closed || session.finishResolve) return;
+  const buffer = Buffer.from(bytes instanceof ArrayBuffer ? new Uint8Array(bytes) : bytes || []);
+  if (!buffer.length || buffer.length > 512 * 1024) return;
+  session.audioQueue.push(buffer);
+  session.queuedBytes += buffer.length;
+  // 30 seconds of 16 kHz mono PCM16; the full recording still stays on disk.
+  while (session.queuedBytes > TRANSCRIPTION_SAMPLE_RATE * 2 * 30) {
+    session.queuedBytes -= session.audioQueue.shift().length;
+    if (!session.audioGap) {
+      session.audioGap = true;
+      emitTranscription(session, { type: 'warning', code: 'audio_gap' });
+    }
+  }
+  flushTranscriptionAudio(session);
+});
+
+ipcMain.handle('transcription:finish', (event) => {
+  const session = transcriptionSessions.get(event.sender.id);
+  if (!session || session.closed) return { ok: false, error: 'not_active', transcript: '' };
+  if (session.finishResolve) return { ok: false, error: 'already_finishing', transcript: sessionTranscript(session) };
+  return new Promise((resolve) => {
+    session.finishResolve = resolve;
+    session.finishTimer = setTimeout(() => {
+      closeTranscriptionSession(session, { ok: false, error: 'finish_timeout' });
+    }, TRANSCRIPTION_FINISH_TIMEOUT_MS);
+    if (session.ready && session.socket?.readyState === WebSocket.OPEN) {
+      try {
+        session.socket.send(JSON.stringify({ event_id: transcriptionEventId(), type: 'session.finish' }));
+      } catch (error) {
+        closeTranscriptionSession(session, { ok: false, error: 'finish_send_failed' });
+      }
+    } else {
+      closeTranscriptionSession(session, { ok: false, error: 'connection_closed' });
+    }
+  });
+});
+
+function closeAllTranscriptionSessions() {
+  for (const session of transcriptionSessions.values()) {
+    closeTranscriptionSession(session, { ok: false, error: 'app_quit' });
+  }
+}
+
+// ============ 录音资料库 ============
+function getRecordingsDir() {
+  return workspacePath(RECORDINGS_DIR_NAME);
+}
+
+function ensureRecordingsDir() {
+  try {
+    fs.mkdirSync(getRecordingsDir(), { recursive: true });
+  } catch (error) {
+    // 目录不可用时由保存 IPC 返回失败。
+  }
+}
+
+function getSafeRecordingPath(value) {
+  if (typeof value !== 'string' || !value.trim()) return null;
+  const directory = path.resolve(getRecordingsDir());
+  const resolvedPath = path.isAbsolute(value)
+    ? path.resolve(value)
+    : path.resolve(workspaceRoot(), value);
+  if (path.dirname(resolvedPath) !== directory) return null;
+  if (!/^recording-[a-z0-9-]+\.(webm|m4a|ogg|wav|mp4)$/i.test(path.basename(resolvedPath))) {
+    return null;
+  }
+  try {
+    const directoryStat = fs.lstatSync(directory);
+    const fileStat = fs.lstatSync(resolvedPath);
+    if (directoryStat.isSymbolicLink() || !directoryStat.isDirectory()) return null;
+    if (fileStat.isSymbolicLink() || !fileStat.isFile()) return null;
+    return resolvedPath;
+  } catch (error) {
+    return null;
+  }
+}
+
+ipcMain.handle('recordings:save', async (event, payload) => {
+  if (!payload || !payload.bytes) return { ok: false, error: 'empty_audio' };
+  let buffer;
+  try {
+    buffer = Buffer.from(payload.bytes);
+  } catch (error) {
+    return { ok: false, error: 'invalid_audio' };
+  }
+  if (!buffer.length || buffer.length > RECORDING_MAX_BYTES) {
+    return { ok: false, error: buffer.length ? 'audio_too_large' : 'empty_audio' };
+  }
+  ensureRecordingsDir();
+  const mimeType = String(payload.mimeType || 'audio/webm').slice(0, 80);
+  const extension = recordingExtension(mimeType);
+  const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
+  const audioPath = path.join(getRecordingsDir(), `recording-${id}.${extension}`);
+  try {
+    await fs.promises.writeFile(audioPath, buffer, { flag: 'wx' });
+    const finalized = await finalizeSavedRecording(audioPath, mimeType);
+    return {
+      ok: true,
+      audioPath: platformPolicy.portableMediaPath(RECORDINGS_DIR_NAME, finalized.filePath),
+      mimeType: finalized.mimeType,
+    };
+  } catch (error) {
+    return { ok: false, error: 'write_failed' };
+  }
+});
+
+const recordingWriteSessions = new Map();
+
+async function closeRecordingWriteSession(senderId, { discard = false } = {}) {
+  const current = recordingWriteSessions.get(senderId);
+  if (!current) return;
+  recordingWriteSessions.delete(senderId);
+  try { await current.handle.close(); } catch (error) {}
+  if (discard) {
+    try { await fs.promises.unlink(current.filePath); } catch (error) {}
+  }
+}
+
+async function abortAllRecordingWriteSessions() {
+  const ids = [...recordingWriteSessions.keys()];
+  for (const senderId of ids) {
+    await closeRecordingWriteSession(senderId, { discard: true });
+  }
+}
+
+ipcMain.handle('recordings:begin', async (event, payload) => {
+  const mimeType = String(payload && payload.mimeType || 'video/webm').slice(0, 80);
+  const extension = recordingExtension(mimeType);
+  if (!/^(webm|m4a|ogg|wav|mp4)$/i.test(extension)) return { ok: false, error: 'invalid_type' };
+  await closeRecordingWriteSession(event.sender.id, { discard: true });
+  ensureRecordingsDir();
+  const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
+  const filePath = path.join(getRecordingsDir(), `recording-${id}.${extension}`);
+  try {
+    const handle = await fs.promises.open(filePath, 'wx');
+    recordingWriteSessions.set(event.sender.id, {
+      handle,
+      filePath,
+      mimeType,
+      bytesWritten: 0,
+    });
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: 'write_failed' };
+  }
+});
+
+ipcMain.handle('recordings:append', async (event, bytes) => {
+  const current = recordingWriteSessions.get(event.sender.id);
+  if (!current) return { ok: false, error: 'not_started' };
+  let buffer;
+  try {
+    buffer = Buffer.from(bytes);
+  } catch (error) {
+    return { ok: false, error: 'invalid_audio' };
+  }
+  if (!buffer.length) return { ok: true };
+  if (current.bytesWritten + buffer.length > RECORDING_MAX_BYTES) {
+    return { ok: false, error: 'audio_too_large' };
+  }
+  try {
+    await current.handle.write(buffer);
+    current.bytesWritten += buffer.length;
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: 'write_failed' };
+  }
+});
+
+ipcMain.handle('recordings:finish', async (event) => {
+  const current = recordingWriteSessions.get(event.sender.id);
+  if (!current) return { ok: false, error: 'not_started' };
+  recordingWriteSessions.delete(event.sender.id);
+  try {
+    await current.handle.close();
+    if (!current.bytesWritten) {
+      try { await fs.promises.unlink(current.filePath); } catch (error) {}
+      return { ok: false, error: 'empty_audio' };
+    }
+    const finalized = await finalizeSavedRecording(current.filePath, current.mimeType);
+    return {
+      ok: true,
+      audioPath: platformPolicy.portableMediaPath(RECORDINGS_DIR_NAME, finalized.filePath),
+      mimeType: finalized.mimeType,
+    };
+  } catch (error) {
+    try { await fs.promises.unlink(current.filePath); } catch (cleanupError) {}
+    return { ok: false, error: 'write_failed' };
+  }
+});
+
+ipcMain.handle('recordings:abort', async (event) => {
+  await closeRecordingWriteSession(event.sender.id, { discard: true });
+  return { ok: true };
+});
+
+ipcMain.handle('recordings:read', async (event, audioPath) => {
+  const safePath = getSafeRecordingPath(audioPath);
+  if (!safePath) return null;
+  try {
+    const bytes = await fs.promises.readFile(safePath);
+    const extension = path.extname(safePath).slice(1).toLowerCase();
+    const mimeType = extension === 'm4a' ? 'audio/mp4'
+      : extension === 'mp4' ? 'video/mp4'
+      : extension === 'ogg' ? 'audio/ogg'
+      : extension === 'wav' ? 'audio/wav'
+      : extension === 'webm' ? 'application/octet-stream'
+      : `audio/${extension || 'webm'}`;
+    return { bytes, mimeType };
+  } catch (error) {
+    return null;
+  }
+});
+
+ipcMain.handle('recordings:delete', async (event, audioPath) => {
+  const safePath = getSafeRecordingPath(audioPath);
+  if (!safePath) return false;
+  try {
+    await fs.promises.unlink(safePath);
+    return true;
+  } catch (error) {
+    return false;
+  }
+});
+
+ipcMain.handle('recordings:reveal', (event, audioPath) => {
+  const safePath = getSafeRecordingPath(audioPath);
+  if (!safePath) return false;
+  shell.showItemInFolder(safePath);
+  return true;
+});
+
+ipcMain.handle('recordings:open-folder', async () => {
+  try {
+    ensureRecordingsDir();
+    const error = await shell.openPath(getRecordingsDir());
+    return { ok: !error, error: error || undefined };
+  } catch (error) {
+    return { ok: false, error: error && error.message };
+  }
+});
+
+// ============ 剪贴板历史 ============
+
+function getClipImagesDir() {
+  return workspacePath(CLIP_IMAGES_DIR_NAME);
+}
+
+// 图片记录使用扁平目录和固定文件名。拒绝子目录、符号链接和非普通文件，
+// 避免 localStorage 被篡改后通过 ../ 或 symlink 读写目录外文件。
+function getSafeClipImagePath(p) {
+  if (typeof p !== 'string' || !p.trim()) return false;
+  const dir = path.resolve(getClipImagesDir());
+  const resolvedPath = path.isAbsolute(p)
+    ? path.resolve(p)
+    : path.resolve(workspaceRoot(), p);
+  if (path.dirname(resolvedPath) !== dir) return null;
+  if (!/^clip-[a-z0-9]+\.png$/i.test(path.basename(resolvedPath))) return null;
+  try {
+    const dirStat = fs.lstatSync(dir);
+    const fileStat = fs.lstatSync(resolvedPath);
+    if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) return null;
+    if (fileStat.isSymbolicLink() || !fileStat.isFile()) return null;
+    return resolvedPath;
+  } catch (e) {
+    return null;
+  }
+}
+
+function ensureClipImagesDir() {
+  try {
+    fs.mkdirSync(getClipImagesDir(), { recursive: true });
+  } catch (e) {
+    // 目录已存在或无权限，静默
+  }
+}
+
+async function readSystemClipboard(includeImage = false) {
+  try {
+    const items = await clipboard.read();
+    const observation = await readClipboardObservation(items, { includeImage });
+    let image = null;
+    if (observation.image?.buffer) {
+      const native = nativeImage.createFromBuffer(observation.image.buffer);
+      if (!native.isEmpty()) {
+        const size = native.getSize();
+        image = prepareClipboardImagePayload(
+          observation.image.mimeType,
+          observation.image.buffer,
+          size
+        );
+      }
+    }
+    return { concealed: observation.concealed, text: observation.text, image };
+  } catch (error) {
+    return { concealed: false, text: '', image: null };
+  }
+}
+
+async function baselineCurrentClipboard(generation) {
+  try {
+    const observation = await readSystemClipboard(true);
+    if (!clipPollingEnabled || generation !== clipPollingGeneration) return;
+    if (observation.concealed) {
+      clipObservationState = reduceClipboardObservation(
+        {},
+        { concealed: true },
+        { baseline: true }
+      ).state;
+      return;
+    }
+    clipObservationState = reduceClipboardObservation(
+      {},
+      { text: observation.text, imageFingerprint: observation.image?.fingerprint || null },
+      { baseline: true }
+    ).state;
+    lastClipImageProbeAt = Date.now();
+  } catch (error) {
+    clipObservationState = { textFingerprint: null, imageFingerprint: null };
+  }
+}
+
+async function pollClipboard() {
+  if (!clipPollingEnabled || !mainWindow) return;
+  if (clipPolling) return;
+  clipPolling = true;
+  try {
+    const now = Date.now();
+    const includeImage = now - lastClipImageProbeAt >= CLIP_IMAGE_POLL_INTERVAL_MS;
+    const observation = await readSystemClipboard(includeImage);
+    if (!clipPollingEnabled) return;
+    // 密码管理器写入的敏感内容：跳过不记录、不更新指纹
+    if (observation.concealed) return;
+
+    // 优先读文字
+    const text = observation.text;
+    if (text) {
+      const decision = reduceClipboardObservation(clipObservationState, { text });
+      clipObservationState = decision.state;
+      if (decision.record && clipPollingEnabled) {
+        const type = /^https?:\/\//i.test(text.trim()) ? 'url' : 'text';
+        mainWindow.webContents.send('clipboard:new-entry', { type, text, imagePath: null });
+      }
+      return;
+    }
+
+    // 文字为空再读图片
+    if (!text && includeImage) {
+      lastClipImageProbeAt = now;
+      const result = observation.image;
+      const decision = reduceClipboardObservation(clipObservationState, {
+        text: '',
+        imageFingerprint: result?.fingerprint || null,
+      });
+      clipObservationState = decision.state;
+      if (result && decision.record && clipPollingEnabled) {
+        const pngBuf = result.pngBuffer
+          || nativeImage.createFromBuffer(result.sourceBuffer).toPNG();
+        if (!pngBuf.length) return;
+        ensureClipImagesDir();
+        const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+        const fileName = 'clip-' + id + '.png';
+        const imagePath = path.join(getClipImagesDir(), fileName);
+        try {
+          await fs.promises.writeFile(imagePath, pngBuf);
+        } catch (e) {
+          return; // 写盘失败不记录
+        }
+        if (!clipPollingEnabled) {
+          try { await fs.promises.unlink(imagePath); } catch (error) {}
+          return;
+        }
+        mainWindow.webContents.send('clipboard:new-entry', {
+          type: 'image',
+          text: null,
+          imagePath: platformPolicy.portableMediaPath(CLIP_IMAGES_DIR_NAME, imagePath),
+        });
+      }
+    }
+  } catch (e) {
+    // 轮询任何异常不能崩主进程，静默
+  } finally {
+    clipPolling = false;
+  }
+}
+
+function startClipboardPolling() {
+  // Electron 没有 NSPasteboard.changeCount，只能内容轮询：靠文本本身与
+  // 图片 PNG 内容哈希指纹去重（见 pollClipboard）。
+  if (clipPollingEnabled) return;
+  clipPollingEnabled = true;
+  const generation = ++clipPollingGeneration;
+  // 首次开启只建立当前系统剪贴板基线，不把开启前的内容写入历史。
+  clipBaselineTimer = setTimeout(() => {
+    clipBaselineTimer = null;
+    if (!clipPollingEnabled) return;
+    void baselineCurrentClipboard(generation).finally(() => {
+      if (clipPollingEnabled && generation === clipPollingGeneration && !clipPollTimer) {
+        clipPollTimer = setInterval(pollClipboard, CLIP_POLL_INTERVAL_MS);
+      }
+    });
+  }, 0);
+}
+
+function stopClipboardPolling() {
+  clipPollingEnabled = false;
+  clipPollingGeneration += 1;
+  if (clipBaselineTimer) {
+    clearTimeout(clipBaselineTimer);
+    clipBaselineTimer = null;
+  }
+  if (clipPollTimer) {
+    clearInterval(clipPollTimer);
+    clipPollTimer = null;
+  }
+  clipObservationState = { textFingerprint: null, imageFingerprint: null };
+  lastClipImageProbeAt = 0;
+}
+
+function setHoverSpaceShortcut(enabled) {
+  if (enabled === spaceShortcutRegistered) return;
+  if (!enabled) {
+    if (globalShortcut.isRegistered('Space')) globalShortcut.unregister('Space');
+    spaceShortcutRegistered = false;
+    return;
+  }
+  try {
+    const ok = globalShortcut.register('Space', async () => {
+      if (!mainWindow || mainWindow.isDestroyed()) return;
+      // 展开动作后的极短窗口内，全局 Space 还未来得及注销；这时也要把第二次
+      // Space 作为收起处理，避免快速连按被吞掉。
+      if (currentMode === 'expanded') {
+        mainWindow.webContents.send('shortcut:toggle-panel');
+        return;
+      }
+      if (clipFeatureEnabled) await rememberPasteTarget();
+      hideWhenCollapsed = false;
+      if (!mainWindow.isVisible()) mainWindow.show();
+      mainWindow.focus();
+      mainWindow.webContents.send('shortcut:toggle-panel');
+    });
+    spaceShortcutRegistered = ok && globalShortcut.isRegistered('Space');
+  } catch (error) {
+    spaceShortcutRegistered = false;
+  }
+}
+
+function startHoverSpaceShortcut() {
+  const policy = hoverSpacePollingPolicy({
+    shortcut: configuredShortcut,
+    visible: Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible()),
+    mode: currentMode,
+  });
+  if (!policy.enabled) return;
+  if (spaceShortcutTimer) return;
+  spaceShortcutTimer = setInterval(() => {
+    const currentPolicy = hoverSpacePollingPolicy({
+      shortcut: configuredShortcut,
+      visible: Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible()),
+      mode: currentMode,
+    });
+    if (!currentPolicy.enabled) {
+      stopHoverSpaceShortcut();
+      return;
+    }
+    const point = screen.getCursorScreenPoint();
+    const inside = (bounds) => point.x >= bounds.x && point.x < bounds.x + bounds.width
+      && point.y >= bounds.y && point.y < bounds.y + bounds.height;
+    // 岛的耳朵比折叠条宽：悬停在耳朵上按空格也应该能唤出面板。
+    const hovering = inside(mainWindow.getBounds())
+      || Boolean(islandHotRect && islandWindow && !islandWindow.isDestroyed() && islandWindow.isVisible() && inside(islandHotRect));
+    setHoverSpaceShortcut(hovering);
+  }, policy.intervalMs);
+}
+
+function stopHoverSpaceShortcut() {
+  if (spaceShortcutTimer) clearInterval(spaceShortcutTimer);
+  spaceShortcutTimer = null;
+  setHoverSpaceShortcut(false);
+}
+
+function syncHoverSpacePolling() {
+  const policy = hoverSpacePollingPolicy({
+    shortcut: configuredShortcut,
+    visible: Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible()),
+    mode: currentMode,
+  });
+  if (policy.enabled) startHoverSpaceShortcut();
+  else stopHoverSpaceShortcut();
+}
+
+ipcMain.handle('shortcut:hover-space-status', () => ({
+  registered: spaceShortcutRegistered && globalShortcut.isRegistered('Space'),
+  mode: currentMode,
+  cursor: screen.getCursorScreenPoint(),
+  bounds: mainWindow && !mainWindow.isDestroyed() ? mainWindow.getBounds() : null,
+}));
+
+// 渲染层请求把图片文件读成 dataURL 回显（contextIsolation 下 file:// 受限，走 IPC 读盘）
+ipcMain.handle('clipboard:readImage', async (event, imagePath) => {
+  const safePath = getSafeClipImagePath(imagePath);
+  if (!safePath) return null; // 只允许读自己的图片目录
+  try {
+    const buf = await fs.promises.readFile(safePath);
+    return `data:image/png;base64,${buf.toString('base64')}`;
+  } catch (e) {
+    return null;
+  }
+});
+
+// FIFO 淘汰 / 删除 / 清空时，连带删除本地图片文件（文件 I/O 归主进程）
+ipcMain.handle('clipboard:deleteImages', async (event, paths) => {
+  if (!Array.isArray(paths)) return;
+  for (const p of paths) {
+    const safePath = getSafeClipImagePath(p);
+    if (safePath) {
+      try {
+        await fs.promises.unlink(safePath);
+      } catch (e) {
+        // 文件已不存在等，静默
+      }
+    }
+  }
+});
+
+async function writeClipboardEntry(entry) {
+  if (!entry) return false;
+  try {
+    const safeImagePath =
+      entry.type === 'image' ? getSafeClipImagePath(entry.imagePath) : null;
+    if (safeImagePath) {
+      const buf = fs.readFileSync(safeImagePath);
+      const image = nativeImage.createFromBuffer(buf);
+      if (image.isEmpty()) return false;
+      const pngBuf = image.toPNG();
+      await clipboard.write([
+        new ClipboardItem({
+          'image/png': new Blob([pngBuf], { type: 'image/png' }),
+        }),
+      ]);
+      const size = image.getSize();
+      const fingerprint = createClipboardImageFingerprint(size.width, size.height, pngBuf);
+      if (fingerprint) {
+        clipObservationState = reduceClipboardObservation(
+          clipObservationState,
+          { imageFingerprint: fingerprint },
+          { baseline: true }
+        ).state;
+      }
+    } else if (entry.text) {
+      await clipboard.writeText(entry.text);
+      clipObservationState = reduceClipboardObservation(
+        clipObservationState,
+        { text: entry.text },
+        { baseline: true }
+      ).state;
+    } else {
+      return false;
+    }
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function waitForCollapsedPanel(timeoutMs = 950) {
+  const deadline = Date.now() + timeoutMs;
+  return new Promise((resolve) => {
+    const check = () => {
+      if (currentMode !== 'expanded' || Date.now() >= deadline) return resolve(currentMode !== 'expanded');
+      setTimeout(check, 32);
+    };
+    check();
+  });
+}
+
+function pasteToPreviousApp(target) {
+  return new Promise((resolve) => {
+    const bundleId = String(target?.bundleId || '');
+    if (!bundleId) return resolve(false);
+    execFile('/usr/bin/osascript', [
+      '-l', 'JavaScript', '-e', PASTE_TO_APP_JXA, bundleId,
+    ], { timeout: 3000 }, (error, stdout) => {
+      resolve(!error && String(stdout || '').trim() === 'ok');
+    });
+  });
+}
+
+ipcMain.handle('clipboard:write', (event, entry) => writeClipboardEntry(entry));
+
+// 点击历史项后先收起灵动岛，再回到打开面板前的应用执行粘贴。
+// 若系统尚未授予辅助功能权限，内容仍保留在系统剪贴板作为可靠降级。
+ipcMain.handle('clipboard:paste', async (event, entry) => {
+  if (!await writeClipboardEntry(entry)) return { ok: false, pasted: false };
+  if (!PLATFORM_CAPABILITIES.automaticPaste) return { ok: true, pasted: false };
+  if (process.platform === 'darwin' && !systemPreferences.isTrustedAccessibilityClient(false)) {
+    openPermissionsWindow();
+    return { ok: true, pasted: false, permissionRequired: true };
+  }
+  const target = previousPasteTarget;
+  requestRendererCollapse();
+  await waitForCollapsedPanel();
+  const pasted = await pasteToPreviousApp(target);
+  return { ok: true, pasted };
+});
+
+function ensureFirstRunAutoLaunch() {
+  // 首次运行时默认开启开机自启；之后尊重用户在托盘菜单的选择
+  if (process.platform !== 'darwin') return;
+  // 只对打包后的应用生效：开发态与测试跑的是 node_modules 里的 Electron.app，
+  // 在这里登记自启会把「Electron」本身加进用户的登录项。
+  if (!app.isPackaged) return;
+  const marker = path.join(app.getPath('userData'), '.first-run-done');
+  if (fs.existsSync(marker)) return;
+  try {
+    setAutoLaunch(true);
+    fs.writeFileSync(marker, String(Date.now()));
+  } catch (e) {
+    // ignore
+  }
+}
+
+function watchDisplayChanges() {
+  // 接/拔外接屏、改变屏幕排列、改分辨率 → 自动重新定位到当前活跃屏顶部居中
+  // 加 100ms 防抖：插拔屏时系统会连续触发多次事件
+  let timer = null;
+  const reposition = () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      if (!mainWindow) return;
+      repositionWindow();
+      if (!mainWindow.webContents.isDestroyed()) {
+        mainWindow.webContents.send('window:metrics-changed', getLayoutMetrics());
+      }
+      notchGeometry.refresh();
+      syncIsland();
+    }, 100);
+  };
+  screen.on('display-added', reposition);
+  screen.on('display-removed', reposition);
+  screen.on('display-metrics-changed', reposition);
+}
+
+app.whenReady().then(() => {
+  if (process.platform === 'win32') app.setAppUserModelId('com.dynamicpanel.app');
+  if (process.platform === 'darwin' && app.dock) {
+    app.dock.hide();
+  }
+
+  ensureFirstRunAutoLaunch();
+  createWindow();
+  createTray();
+  watchDisplayChanges();
+  notchGeometry.refresh();
+  ensureClipImagesDir();
+  ensureRecordingsDir();
+  applyAppSettings();
+  startTaskNotificationServer();
+  startTodoInboxWatcher();
+  startWorkInboxWatcher();
+  startLinkInboxWatcher();
+  showPermissionsOnboardingIfNeeded();
+
+  app.on('activate', () => {
+    // 岛窗口与权限窗口也算在 getAllWindows 里，这里只关心主面板是否还在。
+    if (!mainWindow) createWindow();
+  });
+});
+
+// 常驻菜单栏应用：所有窗口暂时关闭时仍保持后台运行。
+app.on('window-all-closed', () => {});
+
+// 退出前给渲染层一次机会把「撤销窗口内尚未真正执行的删除」落地（删音频文件、删保险库记录），
+// 否则删了一半就退出：密钥还留在保险库里，录音的音频成了孤儿文件。最多等 0.8 秒。
+let quitFlushStarted = false;
+app.on('before-quit', (event) => {
+  const canFlush = mainWindow && !mainWindow.isDestroyed() && !mainWindow.webContents.isDestroyed();
+  if (!quitFlushStarted && canFlush) {
+    quitFlushStarted = true;
+    event.preventDefault();
+    let finished = false;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      setTimeout(() => app.quit(), 150); // 留给已发出的文件删除落盘
+    };
+    const timer = setTimeout(finish, 800);
+    ipcMain.once('app:flush-done', () => {
+      clearTimeout(timer);
+      finish();
+    });
+    mainWindow.webContents.send('app:flush-pending');
+    return;
+  }
+  isQuitting = true;
+  hideWhenCollapsed = false;
+});
+
+app.on('will-quit', () => {
+  cancelCollapseWatchdog();
+  clearTodoReminderTimer();
+  stopTodoInboxWatcher();
+  stopWorkInboxWatcher();
+  stopLinkInboxWatcher();
+  stopHoverSpaceShortcut();
+  clearTaskNotificationTimers();
+  stopTaskNotificationServer();
+  agentUsageMonitor.stop();
+  if (islandHoverTimer) clearInterval(islandHoverTimer);
+  closeAllTranscriptionSessions();
+  abortAllRecordingWriteSessions();
+  globalShortcut.unregisterAll();
+  stopClipboardPolling();
+});

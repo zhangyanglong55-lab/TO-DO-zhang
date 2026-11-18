@@ -1,0 +1,18 @@
+{
+  "links": [
+    {
+      "url": "https://github.com/xiaopu-ai/TO-DO-Panel",
+      "title": "TO-DO Panel",
+      "category": "开发"
+    },
+    {
+      "url": "https://mp.weixin.qq.com/s/FOgMWOGhRqUzX8pyBTuZLQ",
+      "title": "AI以88:12赢下250名三甲医生：奇点已至，未来医生已率先拿到船票？",
+      "category": "阅读",
+      "summary": "医健人物：未来医生 MedGPT 在40例肺癌灰区病例上，对250名三甲医生盲测以88:12取胜，人机协作提升24.1%。文章认为严肃医疗AI应走B端决策与担责，而不是轻问诊。"
+    },
+    {
+      "url": "https://www.feishu.cn/"
+    }
+  ]
+}

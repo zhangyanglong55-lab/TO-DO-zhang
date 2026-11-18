@@ -1,0 +1,8 @@
+This repository is a customized distribution of TO-DO Panel.
+
+Upstream project: https://github.com/xiaopu-ai/TO-DO-Panel
+License: MIT License (see LICENSE)
+Copyright (c) 2026 TO-DO Panel contributors
+Original author attribution in package.json: xiaopu-ai
+
+Modifications in this repository (zhangyanglong55-lab/TO-DO-zhang) are also released under the MIT License.
