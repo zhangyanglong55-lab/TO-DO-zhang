@@ -30,6 +30,9 @@ const {
   validateHomeWidgetLayout,
   layoutVariantForPlacement,
   moveHomeWidgetToCell,
+  resizeHomeWidget,
+  placementFromResizeEdge,
+  resizeHomeWidgetFromEdge,
   findHomeWidgetAtCell,
   sizeNameForPlacement,
   calculateAudioLevel,
@@ -783,7 +786,7 @@ test('home layout validation rejects every incomplete or unsafe shape', () => {
   assert.equal(validateHomeWidgetLayout({ placements: {} }, ['music'], 12, 4), false);
   assert.equal(validateHomeWidgetLayout({
     placements: { music: { column: 0, row: 0, width: 12, height: 3 } },
-  }, ['music'], 12, 4), false);
+  }, ['music'], 12, 4), true);
   assert.equal(validateHomeWidgetLayout({
     placements: { music: { column: 0, row: 0, width: 12.5, height: 4 } },
   }, ['music'], 12, 4), false);
@@ -795,7 +798,7 @@ test('home layout validation rejects every incomplete or unsafe shape', () => {
   }, ['music', 'windows'], 12, 4), false);
 });
 
-test('dropping a widget onto another cell swaps their positions and adapts size', () => {
+test('dropping a widget moves it to the target cell and keeps its size', () => {
   const order = ['music', 'pomodoro', 'windows', 'recorder', 'mirror', 'note', 'commands'];
   const sizes = {
     music: 'medium', pomodoro: 'mini', windows: 'large', recorder: 'small',
@@ -807,31 +810,91 @@ test('dropping a widget onto another cell swaps their positions and adapts size'
   assert.ok(windows && music);
   const dropped = moveHomeWidgetToCell(layout, 'music', windows.column, windows.row);
   assert.ok(dropped);
-  assert.deepEqual(dropped.placements.music, windows);
-  assert.deepEqual(dropped.placements.windows, music);
-  assert.equal(dropped.sizes.music, sizeNameForPlacement(windows));
-  assert.equal(dropped.sizes.windows, sizeNameForPlacement(music));
+  assert.equal(dropped.placements.music.column, windows.column);
+  assert.equal(dropped.placements.music.row, windows.row);
+  assert.equal(dropped.placements.music.width, music.width);
+  assert.equal(dropped.placements.music.height, music.height);
+  assert.equal(dropped.sizes.music, sizeNameForPlacement(music));
+  assert.notDeepEqual(dropped.placements.windows, music);
   assert.equal(validateHomeWidgetLayout(dropped, dropped.visibleOrder, 12, 4), true);
   assert.equal(moveHomeWidgetToCell(layout, 'music', music.column, music.row), null);
   assert.equal(findHomeWidgetAtCell(layout.placements, windows.column, windows.row).id, 'windows');
 });
 
-test('preferred placements are kept when they still fill the grid, otherwise packing is used', () => {
+test('resizing a widget changes only that widget when there is room, otherwise fails cleanly', () => {
+  const layout = {
+    visibleOrder: ['music', 'note'],
+    placements: {
+      music: { column: 0, row: 0, width: 4, height: 2 },
+      note: { column: 6, row: 0, width: 4, height: 2 },
+    },
+  };
+  const grown = resizeHomeWidget(layout, 'music', 6, 2);
+  assert.ok(grown);
+  assert.deepEqual(grown.placements.music, { column: 0, row: 0, width: 6, height: 2 });
+  assert.deepEqual(grown.placements.note, { column: 6, row: 0, width: 4, height: 2 });
+  const blocked = resizeHomeWidget(grown, 'music', 8, 2);
+  assert.ok(blocked);
+  assert.deepEqual(blocked.placements.music, { column: 0, row: 0, width: 8, height: 2 });
+  assert.equal(blocked.placements.note.width, 4);
+  assert.equal(blocked.placements.note.height, 2);
+  assert.ok(blocked.placements.note.column >= 8 || blocked.placements.note.row >= 2);
+  const tight = {
+    visibleOrder: ['music', 'note'],
+    placements: {
+      music: { column: 0, row: 0, width: 6, height: 4 },
+      note: { column: 6, row: 0, width: 6, height: 4 },
+    },
+  };
+  assert.equal(resizeHomeWidget(tight, 'music', 8, 4), null);
+});
+
+test('resizing from the west or north edge moves the origin and keeps the opposite edge fixed', () => {
+  const layout = {
+    visibleOrder: ['music', 'note'],
+    placements: {
+      music: { column: 4, row: 1, width: 4, height: 2 },
+      note: { column: 10, row: 0, width: 2, height: 2 },
+    },
+  };
+  const west = resizeHomeWidgetFromEdge(layout, 'music', 'w', 2, 1);
+  assert.ok(west);
+  assert.deepEqual(west.placements.music, { column: 2, row: 1, width: 6, height: 2 });
+  const north = resizeHomeWidgetFromEdge(layout, 'music', 'n', 4, 0);
+  assert.ok(north);
+  assert.deepEqual(north.placements.music, { column: 4, row: 0, width: 4, height: 3 });
+  const northwest = resizeHomeWidgetFromEdge(layout, 'music', 'nw', 2, 0);
+  assert.ok(northwest);
+  assert.deepEqual(northwest.placements.music, { column: 2, row: 0, width: 6, height: 3 });
+  const preview = placementFromResizeEdge(layout.placements.music, 'sw', 2, 3);
+  assert.deepEqual(preview, { column: 2, row: 1, width: 6, height: 3 });
+  const blocked = {
+    visibleOrder: ['music', 'note'],
+    placements: {
+      music: { column: 4, row: 0, width: 8, height: 4 },
+      note: { column: 0, row: 0, width: 4, height: 4 },
+    },
+  };
+  assert.equal(resizeHomeWidgetFromEdge(blocked, 'music', 'w', 0, 0), null);
+});
+
+test('preferred placements are kept when they are still valid, including layouts with gaps', () => {
   const order = ['music', 'pomodoro', 'windows', 'recorder', 'mirror', 'note', 'commands'];
   const sizes = {
     music: 'medium', pomodoro: 'mini', windows: 'large', recorder: 'small',
     mirror: 'medium', note: 'medium', commands: 'mini',
   };
   const packed = resolveHomeWidgetLayout(order, sizes, [], 12, 4);
-  const swapped = moveHomeWidgetToCell(packed, 'music', packed.placements.windows.column, packed.placements.windows.row);
-  const restored = resolveHomeWidgetLayout(order, sizes, [], 12, 4, swapped.placements);
-  assert.deepEqual(restored.placements.music, swapped.placements.music);
-  assert.deepEqual(restored.placements.windows, swapped.placements.windows);
-  const before = JSON.stringify({ order, sizes, preferred: swapped.placements });
-  const invalidPreferred = resolveHomeWidgetLayout(order, sizes, [], 12, 4, { music: { column: 0, row: 0, width: 1, height: 1 } });
-  assert.ok(invalidPreferred);
-  assert.deepEqual(invalidPreferred.placements, packed.placements);
-  assert.equal(JSON.stringify({ order, sizes, preferred: swapped.placements }), before);
+  const moved = moveHomeWidgetToCell(packed, 'music', packed.placements.windows.column, packed.placements.windows.row);
+  const restored = resolveHomeWidgetLayout(order, sizes, [], 12, 4, moved.placements);
+  assert.deepEqual(restored.placements.music, moved.placements.music);
+  assert.deepEqual(restored.placements.windows, moved.placements.windows);
+  const before = JSON.stringify({ order, sizes, preferred: moved.placements });
+  const partialPreferred = resolveHomeWidgetLayout(order, sizes, [], 12, 4, { music: { column: 0, row: 0, width: 2, height: 2 } });
+  assert.ok(partialPreferred);
+  assert.deepEqual(partialPreferred.placements.music, { column: 0, row: 0, width: 2, height: 2 });
+  assert.equal(validateHomeWidgetLayout(partialPreferred, partialPreferred.visibleOrder, 12, 4), true);
+  assert.equal(JSON.stringify({ order, sizes, preferred: moved.placements }), before);
 });
 
 test('audio level returns stable RMS volume for recording strands', () => {

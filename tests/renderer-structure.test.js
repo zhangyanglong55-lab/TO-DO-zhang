@@ -13,21 +13,53 @@ test('todo P0 is a two-tab work board rather than a renameable 课程 header', (
   const p0 = html.match(/<section class="quadrant tile work-board"[\s\S]*?<section class="quadrant tile" data-priority="P1">/)?.[0] || '';
   assert.match(p0, /data-work-bucket="daily"/);
   assert.match(p0, /data-work-bucket="weekly"/);
-  assert.match(p0, /今天还没有日报/);
+  assert.doesNotMatch(p0, /今天还没有日报/);
+  assert.doesNotMatch(p0, /本周还没有周报/);
   assert.doesNotMatch(p0, /class="todo-category-name" data-category="P0"/);
   assert.match(appJs, /TODO_CATEGORY_DEFAULTS = \{[\s\S]*P0: '每日工作'/);
   assert.match(workspaceJs, /function startLinkInbox\(/);
 });
 
-test('work report fills the remaining height of the P0 board', () => {
+test('empty work report is hidden so the todo list can use the space', () => {
   const css = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'styles.css'), 'utf8');
-  const report = css.match(/\.work-report \{[\s\S]*?\n\}/)?.[0] || '';
-  assert.match(report, /flex:\s*1 1 auto/);
-  assert.match(report, /min-height:\s*0/);
-  assert.doesNotMatch(report, /max-height:\s*38%/);
-  assert.match(css, /\.work-board \.todo-list \{[\s\S]*?max-height:\s*28%/);
+  assert.match(css, /\.work-report\.is-empty[\s\S]*?display:\s*none/);
+  assert.match(css, /\.work-board \.todo-list \{[\s\S]*?flex:\s*1 1 0/);
+  assert.match(appJs, /reportEl\.hidden = true/);
 });
 
+
+
+test('mirror tile can be dragged even though the stage is a button', () => {
+  const homeMirror = html.match(/<section class="tile home-mirror"[\s\S]*?<\/section>/)?.[0] || '';
+  assert.match(homeMirror, /id="mirror-stage"[\s\S]*data-home-drag-surface/);
+  assert.match(appJs, /button:not\(\[data-home-drag-surface\]\)/);
+});
+
+test('todo tab work board fills the card and pomodoro resize handle stays on top', () => {
+  const css = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'styles.css'), 'utf8');
+  assert.match(css, /#tab-todo \.todo-list,[\s\S]*?flex:\s*1 1 0/);
+  assert.match(css, /#tab-todo \.work-board \{[\s\S]*?grid-row:\s*1 \/ -1/);
+  assert.match(css, /\.home-pomodoro > \.widget-size-control[\s\S]*?top:\s*8px/);
+  assert.match(css, /\.home-pomodoro > \.widget-resize-handle[\s\S]*?z-index:\s*30/);
+});
+
+test('homepage widgets can be resized from all edges and locked in place', () => {
+  const css = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'styles.css'), 'utf8');
+  assert.match(html, /id="home-layout-lock"/);
+  assert.match(appJs, /HOME_LAYOUT_LOCK_KEY/);
+  assert.match(appJs, /dataset\.widgetResizeEdge/);
+  assert.match(appJs, /resizeHomeWidgetFromEdge/);
+  assert.match(appJs, /\['n', '向上调整高度'\]/);
+  assert.match(css, /\.widget-resize-handle-n \{/);
+  assert.match(css, /\.widget-resize-handle-w \{/);
+  assert.match(css, /\.home-bento\[data-layout-locked='true'\]/);
+});
+
+test('recorder controls stay in flow so mini tiles do not clip their labels', () => {
+  const css = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'styles.css'), 'utf8');
+  assert.match(css, /\.home-recorder \.recorder-controls,[\s\S]*?position:\s*static !important/);
+  assert.match(css, /data-layout-variant='mini'\] #home-open-recordings-folder/);
+});
 
 test('clipboard rows define both favorite icons before rendering entries', () => {
   assert.match(appJs, /const starOutlineSvg\s*=/);
@@ -42,11 +74,13 @@ test('notes have a dedicated top-level tab and management panel', () => {
   assert.match(html, /id="notes-detail"/);
 });
 
-test('home scratch note keeps only the save action', () => {
+test('home scratch note can save and start a new note', () => {
   const homeNote = html.match(/<section class="tile home-note"[\s\S]*?<\/section>/)?.[0] || '';
   assert.match(homeNote, /id="note-save-btn"/);
+  assert.match(homeNote, /id="note-new-btn"/);
   assert.doesNotMatch(homeNote, /id="note-library-btn"/);
   assert.doesNotMatch(homeNote, /id="note-library"/);
+  assert.match(appJs, /function startFreshHomeNote\(/);
 });
 
 test('recordings expose in-page API settings and create a live draft while recording', () => {

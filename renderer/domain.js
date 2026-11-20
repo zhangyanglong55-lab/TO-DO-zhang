@@ -1313,6 +1313,83 @@
     return { ok: true, hiddenIds: ids.filter((candidate) => next.has(candidate)) };
   }
 
+  function placementsOverlap(a, b) {
+    return a.column < b.column + b.width
+      && a.column + a.width > b.column
+      && a.row < b.row + b.height
+      && a.row + a.height > b.row;
+  }
+
+  function clampHomePlacement(placement, columns, rows) {
+    const width = Math.min(Math.max(1, Number(placement.width) || 1), columns);
+    const height = Math.min(Math.max(1, Number(placement.height) || 1), rows);
+    const column = Math.min(Math.max(0, Number(placement.column) || 0), columns - width);
+    const row = Math.min(Math.max(0, Number(placement.row) || 0), rows - height);
+    return { column, row, width, height };
+  }
+
+  function findFreeHomeSlot(placements, width, height, columns, rows, preferred) {
+    if (preferred) {
+      const preferredSlot = clampHomePlacement({ ...preferred, width, height }, columns, rows);
+      const blocked = Object.values(placements).some((item) => placementsOverlap(preferredSlot, item));
+      if (!blocked) return preferredSlot;
+    }
+    let best = null;
+    let bestDist = Infinity;
+    const preferredColumn = Number.isInteger(preferred?.column) ? preferred.column : 0;
+    const preferredRow = Number.isInteger(preferred?.row) ? preferred.row : 0;
+    for (let row = 0; row <= rows - height; row += 1) {
+      for (let column = 0; column <= columns - width; column += 1) {
+        const slot = { column, row, width, height };
+        if (Object.values(placements).some((item) => placementsOverlap(slot, item))) continue;
+        const dist = Math.abs(column - preferredColumn) + Math.abs(row - preferredRow);
+        if (dist < bestDist) {
+          best = slot;
+          bestDist = dist;
+        }
+      }
+    }
+    return best;
+  }
+
+  function arrangeHomePlacements(basePlacements, lockedIds, columns, rows) {
+    const locked = new Set(lockedIds);
+    const next = {};
+    for (const id of locked) {
+      if (!basePlacements[id]) return null;
+      next[id] = clampHomePlacement(basePlacements[id], columns, rows);
+    }
+    const lockedList = [...locked];
+    for (let i = 0; i < lockedList.length; i += 1) {
+      for (let j = i + 1; j < lockedList.length; j += 1) {
+        if (placementsOverlap(next[lockedList[i]], next[lockedList[j]])) return null;
+      }
+    }
+    const movable = Object.keys(basePlacements).filter((id) => !locked.has(id))
+      .sort((left, right) => {
+        const a = basePlacements[left];
+        const b = basePlacements[right];
+        return (b.width * b.height) - (a.width * a.height) || a.row - b.row || a.column - b.column;
+      });
+    for (const id of movable) {
+      const current = basePlacements[id];
+      const slot = findFreeHomeSlot(next, current.width, current.height, columns, rows, current);
+      if (!slot) return null;
+      next[id] = slot;
+    }
+    return next;
+  }
+
+  function commitHomePlacements(placements, columns, rows) {
+    const visibleOrder = Object.keys(placements).sort((left, right) => {
+      const a = placements[left];
+      const b = placements[right];
+      return a.row - b.row || a.column - b.column || left.localeCompare(right);
+    });
+    const result = layoutFromHomePlacements(visibleOrder, placements);
+    return validateHomeWidgetLayout(result, visibleOrder, columns, rows) ? result : null;
+  }
+
   function layoutVariantForPlacement(placement) {
     const width = Number(placement?.width) || 0;
     const height = Number(placement?.height) || 0;
@@ -1343,7 +1420,8 @@
         }
       }
     }
-    return cells.every((count) => count === 1);
+    // 允许留空，只要不重叠、不越界，板块就能停在用户放下的位置。
+    return cells.every((count) => count <= 1);
   }
 
   function sizeNameForPlacement(placement) {
@@ -1387,25 +1465,96 @@
     };
   }
 
-  // 把板块放到指针所在格子：占用该格当前槽位的位置和尺寸，被换走的板块接手原来的位置和尺寸。
-  function moveHomeWidgetToCell(layout, sourceId, column, row) {
+  // 把板块的左上角放到目标格子，保持原来的宽高；挡路的板块会被挪到最近的空位，但不会被改掉大小。
+  function moveHomeWidgetToCell(layout, sourceId, column, row, columns = 12, rows = 4) {
     const placements = layout && layout.placements;
     const source = String(sourceId || '');
     if (!placements || !placements[source]) return null;
-    const hit = findHomeWidgetAtCell(placements, column, row);
-    if (!hit || hit.id === source) return null;
-    const nextPlacements = cloneHomePlacements(placements);
-    nextPlacements[source] = { ...hit.placement };
-    nextPlacements[hit.id] = { column: placements[source].column, row: placements[source].row, width: placements[source].width, height: placements[source].height };
-    const visibleOrder = Object.keys(nextPlacements).sort((left, right) => {
-      const a = nextPlacements[left];
-      const b = nextPlacements[right];
-      return a.row - b.row || a.column - b.column || left.localeCompare(right);
-    });
-    const result = layoutFromHomePlacements(visibleOrder, nextPlacements);
-    const columns = Math.max(...Object.values(nextPlacements).map((item) => item.column + item.width), 0);
-    const rows = Math.max(...Object.values(nextPlacements).map((item) => item.row + item.height), 0);
-    return validateHomeWidgetLayout(result, visibleOrder, columns || 12, rows || 4) ? result : null;
+    if (!Number.isInteger(column) || !Number.isInteger(row)) return null;
+    const current = placements[source];
+    const nextSource = clampHomePlacement({
+      column,
+      row,
+      width: current.width,
+      height: current.height,
+    }, columns, rows);
+    if (nextSource.column === current.column && nextSource.row === current.row) return null;
+    const trial = cloneHomePlacements(placements);
+    trial[source] = nextSource;
+    const arranged = arrangeHomePlacements(trial, [source], columns, rows);
+    return arranged ? commitHomePlacements(arranged, columns, rows) : null;
+  }
+
+  function resizeHomeWidget(layout, sourceId, width, height, columns = 12, rows = 4) {
+    const placements = layout && layout.placements;
+    const source = String(sourceId || '');
+    if (!placements || !placements[source]) return null;
+    const current = placements[source];
+    return resizeHomeWidgetRect(layout, sourceId, {
+      column: current.column,
+      row: current.row,
+      width,
+      height,
+    }, columns, rows);
+  }
+
+  function placementFromResizeEdge(start, edge, pointerColumn, pointerRow, columns = 12, rows = 4, minWidth = 2, minHeight = 1) {
+    if (!start || !edge) return null;
+    if (!Number.isInteger(pointerColumn) || !Number.isInteger(pointerRow)) return null;
+    const right = start.column + start.width;
+    const bottom = start.row + start.height;
+    let column = start.column;
+    let row = start.row;
+    let width = start.width;
+    let height = start.height;
+    if (String(edge).includes('e')) {
+      width = Math.max(minWidth, Math.min(columns - start.column, pointerColumn - start.column + 1));
+      column = start.column;
+    }
+    if (String(edge).includes('w')) {
+      column = Math.max(0, Math.min(pointerColumn, right - minWidth));
+      width = right - column;
+    }
+    if (String(edge).includes('s')) {
+      height = Math.max(minHeight, Math.min(rows - start.row, pointerRow - start.row + 1));
+      row = start.row;
+    }
+    if (String(edge).includes('n')) {
+      row = Math.max(0, Math.min(pointerRow, bottom - minHeight));
+      height = bottom - row;
+    }
+    return clampHomePlacement({ column, row, width, height }, columns, rows);
+  }
+
+  function resizeHomeWidgetRect(layout, sourceId, nextRect, columns = 12, rows = 4) {
+    const placements = layout && layout.placements;
+    const source = String(sourceId || '');
+    if (!placements || !placements[source] || !nextRect) return null;
+    if (!Number.isInteger(nextRect.width) || !Number.isInteger(nextRect.height) || nextRect.width < 1 || nextRect.height < 1) return null;
+    const current = placements[source];
+    const nextSource = clampHomePlacement({
+      column: nextRect.column,
+      row: nextRect.row,
+      width: nextRect.width,
+      height: nextRect.height,
+    }, columns, rows);
+    if (nextSource.width === current.width && nextSource.height === current.height
+      && nextSource.column === current.column && nextSource.row === current.row) {
+      return null;
+    }
+    const trial = cloneHomePlacements(placements);
+    trial[source] = nextSource;
+    const arranged = arrangeHomePlacements(trial, [source], columns, rows);
+    return arranged ? commitHomePlacements(arranged, columns, rows) : null;
+  }
+
+  function resizeHomeWidgetFromEdge(layout, sourceId, edge, pointerColumn, pointerRow, columns = 12, rows = 4) {
+    const placements = layout && layout.placements;
+    const source = String(sourceId || '');
+    if (!placements || !placements[source]) return null;
+    const nextRect = placementFromResizeEdge(placements[source], edge, pointerColumn, pointerRow, columns, rows);
+    if (!nextRect) return null;
+    return resizeHomeWidgetRect(layout, sourceId, nextRect, columns, rows);
   }
 
   function resolveHomeWidgetLayout(order, sizes, hiddenIds, columns = 12, rows = 4, preferredPlacements) {
@@ -1419,12 +1568,37 @@
     if (!visibleOrder.length) return null;
 
     if (preferredPlacements && typeof preferredPlacements === 'object' && !Array.isArray(preferredPlacements)) {
-      const preferred = Object.fromEntries(visibleOrder
-        .filter((id) => preferredPlacements[id] && typeof preferredPlacements[id] === 'object')
-        .map((id) => [id, preferredPlacements[id]]));
-      const preferredLayout = layoutFromHomePlacements(visibleOrder, preferred);
-      if (validateHomeWidgetLayout(preferredLayout, visibleOrder, columns, rows)) {
-        return preferredLayout;
+      const sizeDimensions = {
+        mini: { width: 2, height: 1 },
+        small: { width: 2, height: 2 },
+        medium: { width: 4, height: 2 },
+        large: { width: 4, height: 4 },
+      };
+      const kept = {};
+      for (const id of visibleOrder) {
+        const preferred = preferredPlacements[id];
+        if (!preferred || typeof preferred !== 'object') continue;
+        const values = [preferred.column, preferred.row, preferred.width, preferred.height];
+        if (!values.every(Number.isInteger)) continue;
+        const slot = clampHomePlacement(preferred, columns, rows);
+        if (Object.values(kept).some((item) => placementsOverlap(slot, item))) continue;
+        kept[id] = slot;
+      }
+      let adopted = true;
+      for (const id of visibleOrder.filter((item) => !kept[item])) {
+        const dimension = sizeDimensions[sizes[id]] || sizeDimensions.small;
+        const slot = findFreeHomeSlot(kept, dimension.width, dimension.height, columns, rows, preferredPlacements[id] || null);
+        if (!slot) {
+          adopted = false;
+          break;
+        }
+        kept[id] = slot;
+      }
+      if (adopted) {
+        const preferredLayout = layoutFromHomePlacements(visibleOrder, kept);
+        if (validateHomeWidgetLayout(preferredLayout, visibleOrder, columns, rows)) {
+          return preferredLayout;
+        }
       }
     }
 
@@ -1595,6 +1769,10 @@
     sizeNameForPlacement,
     findHomeWidgetAtCell,
     moveHomeWidgetToCell,
+    resizeHomeWidget,
+    placementFromResizeEdge,
+    resizeHomeWidgetRect,
+    resizeHomeWidgetFromEdge,
     calculateAudioLevel,
     resampleFloat32ToPcm16,
     shouldTogglePanelForSpace,

@@ -86,6 +86,18 @@
             </button>
             <span class="tab-indicator" id="tab-indicator" aria-hidden="true"></span>
           </div>
+          <button class="home-layout-lock" id="home-layout-lock" type="button" aria-pressed="false" aria-label="锁定首页布局" title="锁定布局，防止误拖动或缩放">
+            <svg class="lock-open" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="5" y="11" width="14" height="10" rx="2" />
+              <path d="M8 11V8a4 4 0 0 1 7.5-2" />
+              <path d="M12 15v2" />
+            </svg>
+            <svg class="lock-closed" hidden viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="5" y="11" width="14" height="10" rx="2" />
+              <path d="M8 11V8a4 4 0 0 1 8 0v3" />
+              <path d="M12 15v2" />
+            </svg>
+          </button>
 
         </header>
 
@@ -180,7 +192,7 @@
 
               <!-- 镜子：静态人像封面；点击切换实时镜头 -->
               <section class="tile home-mirror" data-home-module="mirror" data-widget-size="medium">
-                <button class="mirror-stage" id="mirror-stage" type="button" aria-label="打开实时镜子" aria-pressed="false">
+                <button class="mirror-stage" id="mirror-stage" type="button" data-home-drag-surface aria-label="打开实时镜子" aria-pressed="false">
                   <img class="mirror-photo" src="assets/mirror-portrait.jpg" alt="" draggable="false" />
                   <img class="mirror-photo mirror-liquid-layer" src="assets/mirror-portrait.jpg" alt="" draggable="false" />
                   <video class="mirror-video" id="mirror-video" muted playsinline aria-hidden="true"></video>
@@ -201,6 +213,9 @@
                 <div class="note-toolbar" role="toolbar" aria-label="随笔记操作">
                   <span class="tile-label">随笔记</span>
                   <div class="note-persist-actions" role="group" aria-label="速记保存操作">
+                    <button class="note-mode note-new-btn" id="note-new-btn" type="button" aria-label="新建笔记" title="新建笔记">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+                    </button>
                     <button class="note-mode note-save-btn" id="note-save-btn" type="button" aria-label="保存笔记" title="保存笔记">
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 4h12l2 2v14H5z"/><path d="M8 4v6h8V4M8 20v-6h8v6"/></svg>
                     </button>
@@ -242,9 +257,9 @@
                   <button class="bulk-delete todo-bulk-delete" type="button" data-bulk-priority="P0" hidden>删除</button>
                   <span class="count" data-priority="P0">0</span>
                 </div>
-                <article class="work-report is-empty" data-work-report aria-live="polite">
+                <article class="work-report is-empty" data-work-report aria-live="polite" hidden>
                   <h3 class="work-report-title" data-work-report-title hidden></h3>
-                  <div class="work-report-body" data-work-report-body>今天还没有日报</div>
+                  <div class="work-report-body" data-work-report-body></div>
                 </article>
                 <ul class="todo-list" data-priority="P0"></ul>
                 <div class="add-row">

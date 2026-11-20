@@ -1485,7 +1485,6 @@ function renderWorkBoard() {
     tab.setAttribute('aria-selected', selected ? 'true' : 'false');
   });
   const report = activeWorkBucket === 'weekly' ? currentWorkReports.weekly : currentWorkReports.daily;
-  const emptyText = activeWorkBucket === 'weekly' ? '本周还没有周报' : '今天还没有日报';
   const addInput = document.querySelector('.add-row input[data-priority="P0"]');
   const trigger = document.querySelector('.todo-deadline-trigger[data-deadline-priority="P0"]');
   const label = activeWorkBucket === 'weekly' ? '每周工作' : '每日工作';
@@ -1494,14 +1493,16 @@ function renderWorkBoard() {
   if (!reportEl || !bodyEl) return;
   if (!report || !String(report.body || '').trim()) {
     reportEl.classList.add('is-empty');
+    reportEl.hidden = true;
     if (titleEl) {
       titleEl.hidden = true;
       titleEl.textContent = '';
     }
     bodyEl.replaceChildren();
-    bodyEl.textContent = emptyText;
+    bodyEl.textContent = '';
     return;
   }
+  reportEl.hidden = false;
   reportEl.classList.remove('is-empty');
   if (titleEl) {
     titleEl.hidden = !report.title;
@@ -1807,6 +1808,7 @@ const NOTE_ACTIVE_ARCHIVE_KEY = 'notch-note-active-archive-v1';
 const noteInput = document.getElementById('home-note');
 const notePreview = document.getElementById('home-note-preview');
 const noteSaveButton = document.getElementById('note-save-btn');
+const noteNewButton = document.getElementById('note-new-btn');
 const notesList = document.getElementById('notes-list');
 const notesSearch = document.getElementById('notes-search');
 const notesDetail = document.getElementById('notes-detail');
@@ -2618,11 +2620,20 @@ function renderNotesLibrary() {
   renderNotesDetail(notes);
 }
 
-noteSaveButton?.addEventListener('click', () => {
+function startFreshHomeNote() {
+  try { localStorage.removeItem(NOTE_ACTIVE_ARCHIVE_KEY); } catch (error) {}
+  if (!noteInput) return;
+  noteInput.value = '';
+  try { localStorage.setItem(NOTE_KEY, ''); } catch (error) {}
+  if (typeof renderNotePreview === 'function') renderNotePreview();
+  noteInput.focus({ preventScroll: true });
+}
+
+function archiveHomeNote() {
   const content = noteInput?.value.trim() || '';
   if (!content) {
     showStatusToast('先写点内容再存档');
-    return;
+    return false;
   }
   const notes = loadNoteArchive();
   let activeId = localStorage.getItem(NOTE_ACTIVE_ARCHIVE_KEY) || '';
@@ -2634,12 +2645,25 @@ noteSaveButton?.addEventListener('click', () => {
     activeId = generateId();
     notes.unshift({ id: activeId, content, createdAt: Date.now(), updatedAt: Date.now() });
   }
-  localStorage.setItem(NOTE_ACTIVE_ARCHIVE_KEY, activeId);
   localStorage.setItem(NOTE_ARCHIVE_KEY, JSON.stringify(notes.slice(0, 200)));
-  localStorage.setItem(NOTE_KEY, noteInput.value);
   selectedNoteId = activeId;
   renderNotesLibrary();
-  showStatusToast('笔记已保存');
+  showStatusToast('笔记已保存，可以继续写下一篇');
+  startFreshHomeNote();
+  return true;
+}
+
+noteSaveButton?.addEventListener('click', () => {
+  archiveHomeNote();
+});
+
+noteNewButton?.addEventListener('click', () => {
+  const content = noteInput?.value.trim() || '';
+  if (content) {
+    archiveHomeNote();
+    return;
+  }
+  startFreshHomeNote();
 });
 
 notesList?.addEventListener('click', (event) => {
@@ -2762,6 +2786,7 @@ if (notePreview) {
 const HOME_ORDER_KEY = 'notch-home-order-v3';
 const HOME_SIZES_KEY = 'notch-home-widget-sizes-v2';
 const HOME_PLACEMENTS_KEY = 'notch-home-placements-v1';
+const HOME_LAYOUT_LOCK_KEY = 'notch-home-layout-locked-v1';
 const HOME_HIDDEN_MODULES_KEY = 'notch-home-hidden-modules-v1';
 const HOME_MODULE_REGISTRY = ['music', 'pomodoro', 'recorder', 'windows', 'mirror', 'note', 'commands'];
 const unavailableHomeModules = window.NotchPlatform.capabilities(window.notchAPI?.platform || 'darwin').unavailableHomeModules;
@@ -2868,6 +2893,12 @@ const loadedHomeVisibility = loadHiddenHomeModules();
 let hiddenHomeModules = loadedHomeVisibility.hiddenIds;
 let homeVisibilityPersisted = true;
 let homeLayoutReadOnly = false;
+let homeLayoutLocked = false;
+try {
+  homeLayoutLocked = localStorage.getItem(HOME_LAYOUT_LOCK_KEY) === '1';
+} catch (error) {
+  homeLayoutLocked = false;
+}
 let homeLayoutMotionGeneration = 0;
 let homeLayoutMotionAnimations = [];
 const HOME_LAYOUT_MOTION_MS = 560;
@@ -2875,9 +2906,11 @@ const HOME_LAYOUT_MOTION_EASING = 'cubic-bezier(0.22, 1, 0.36, 1)';
 
 function rememberHomePlacements(layout) {
   if (!layout || !layout.placements) return;
-  homePlacements = Object.fromEntries(Object.entries(layout.placements).map(([id, item]) => (
-    [id, { column: item.column, row: item.row, width: item.width, height: item.height }]
-  )));
+  const next = { ...(homePlacements || {}) };
+  Object.entries(layout.placements).forEach(([id, item]) => {
+    next[id] = { column: item.column, row: item.row, width: item.width, height: item.height };
+  });
+  homePlacements = next;
 }
 
 function saveHomeLayout() {
@@ -2885,9 +2918,51 @@ function saveHomeLayout() {
     localStorage.setItem(HOME_ORDER_KEY, JSON.stringify(homeOrder));
     localStorage.setItem(HOME_SIZES_KEY, JSON.stringify(homeSizes));
     if (homePlacements) localStorage.setItem(HOME_PLACEMENTS_KEY, JSON.stringify(homePlacements));
+    localStorage.setItem(HOME_LAYOUT_LOCK_KEY, homeLayoutLocked ? '1' : '0');
   } catch (error) {
     // LocalStorage 不可用时仍保留当前会话内的布局。
   }
+}
+
+function isHomeLayoutFrozen() {
+  return homeLayoutReadOnly || homeLayoutLocked;
+}
+
+function syncHomeLayoutLockButton() {
+  const button = document.getElementById('home-layout-lock');
+  if (!button) return;
+  button.setAttribute('aria-pressed', homeLayoutLocked ? 'true' : 'false');
+  button.setAttribute('aria-label', homeLayoutLocked ? '解锁首页布局' : '锁定首页布局');
+  button.title = homeLayoutLocked ? '已锁定，点击解锁后可拖动和缩放' : '锁定布局，防止误拖动或缩放';
+  const openIcon = button.querySelector('.lock-open');
+  const closedIcon = button.querySelector('.lock-closed');
+  if (openIcon) openIcon.hidden = homeLayoutLocked;
+  if (closedIcon) closedIcon.hidden = !homeLayoutLocked;
+  if (homeBento) homeBento.dataset.layoutLocked = homeLayoutLocked ? 'true' : 'false';
+}
+
+function setHomeLayoutLocked(locked) {
+  homeLayoutLocked = Boolean(locked);
+  try {
+    localStorage.setItem(HOME_LAYOUT_LOCK_KEY, homeLayoutLocked ? '1' : '0');
+  } catch (error) {
+    // 会话内仍保留锁定状态。
+  }
+  syncHomeLayoutLockButton();
+  const frozen = isHomeLayoutFrozen();
+  homeTiles.forEach((tile) => {
+    const sizeButton = tile.querySelector('[data-widget-size-cycle]');
+    if (sizeButton) {
+      sizeButton.hidden = frozen;
+      sizeButton.disabled = frozen;
+      sizeButton.tabIndex = frozen ? -1 : 0;
+    }
+    tile.querySelectorAll('[data-widget-resize]').forEach((resizeHandle) => {
+      resizeHandle.hidden = frozen;
+      resizeHandle.disabled = frozen;
+    });
+  });
+  showStatusToast(homeLayoutLocked ? '首页布局已锁定' : '首页布局已解锁');
 }
 
 function saveHiddenHomeModules() {
@@ -2986,8 +3061,8 @@ function applyHomeLayout(layout, { reason = 'initial' } = {}) {
   const beforeState = reason === 'initial' || reason === 'rollback'
     ? null
     : captureHomeLayoutVisualState();
-  const automaticLayout = !homeLayoutReadOnly && effectiveHomeHidden(hiddenHomeModules).length > 0;
-  homeBento.dataset.layoutMode = homeLayoutReadOnly ? 'safe' : automaticLayout ? 'automatic' : 'preferred';
+  const automaticLayout = false;
+  homeBento.dataset.layoutMode = homeLayoutReadOnly ? 'safe' : 'preferred';
   homeTiles.forEach((tile) => {
     const moduleId = tile.dataset.homeModule;
     const orderIndex = Math.max(0, homeOrder.indexOf(moduleId));
@@ -3020,12 +3095,17 @@ function applyHomeLayout(layout, { reason = 'initial' } = {}) {
       sizeButton.dataset.currentSize = size;
       sizeButton.setAttribute('aria-label', `${HOME_SIZE_LABELS[size]}组件，点击切换尺寸`);
       sizeButton.title = `组件尺寸：${HOME_SIZE_LABELS[size]}`;
-      sizeButton.hidden = automaticLayout || homeLayoutReadOnly;
-      sizeButton.disabled = automaticLayout || homeLayoutReadOnly;
-      sizeButton.tabIndex = automaticLayout || homeLayoutReadOnly ? -1 : 0;
+      sizeButton.hidden = isHomeLayoutFrozen();
+      sizeButton.disabled = isHomeLayoutFrozen();
+      sizeButton.tabIndex = isHomeLayoutFrozen() ? -1 : 0;
     }
+    tile.querySelectorAll('[data-widget-resize]').forEach((resizeHandle) => {
+      resizeHandle.hidden = isHomeLayoutFrozen();
+      resizeHandle.disabled = isHomeLayoutFrozen();
+    });
   });
   rememberHomePlacements(layout);
+  if (homeBento) homeBento.dataset.layoutLocked = homeLayoutLocked ? 'true' : 'false';
   animateCommittedHomeLayout(reason, beforeState);
 }
 
@@ -3036,6 +3116,29 @@ homeTiles.forEach((tile) => {
   sizeButton.dataset.widgetSizeCycle = tile.dataset.homeModule;
   sizeButton.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="6" height="6" rx="1.5"/><rect x="14" y="4" width="6" height="6" rx="1.5"/><rect x="4" y="14" width="6" height="6" rx="1.5"/><rect x="14" y="14" width="6" height="6" rx="1.5"/></svg>';
   tile.appendChild(sizeButton);
+  const resizeEdges = [
+    ['n', '向上调整高度'],
+    ['s', '向下调整高度'],
+    ['e', '向右调整宽度'],
+    ['w', '向左调整宽度'],
+    ['ne', '向右上调整大小'],
+    ['nw', '向左上调整大小'],
+    ['se', '向右下调整大小'],
+    ['sw', '向左下调整大小'],
+  ];
+  resizeEdges.forEach(([edge, label]) => {
+    const resizeHandle = document.createElement('button');
+    resizeHandle.type = 'button';
+    resizeHandle.className = `widget-resize-handle widget-resize-handle-${edge}`;
+    resizeHandle.dataset.widgetResize = tile.dataset.homeModule;
+    resizeHandle.dataset.widgetResizeEdge = edge;
+    resizeHandle.setAttribute('aria-label', label);
+    resizeHandle.title = label;
+    if (edge === 'se') {
+      resizeHandle.innerHTML = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M5 15h10V5M8 15h7V8"/></svg>';
+    }
+    tile.appendChild(resizeHandle);
+  });
 });
 
 const homeModuleIds = new Set(homeTiles.map((tile) => tile.dataset.homeModule));
@@ -3053,6 +3156,7 @@ if (!initialHomeLayout) {
 }
 if (!initialHomeLayout) throw new Error('Default homepage layout validation failed.');
 applyHomeLayout(initialHomeLayout, { reason: 'initial' });
+syncHomeLayoutLockButton();
 
 function visibilitySnapshot() {
   const effectiveHiddenIds = effectiveHomeHidden(homeLayoutReadOnly ? [] : hiddenHomeModules);
@@ -3060,7 +3164,7 @@ function visibilitySnapshot() {
     hiddenIds: [...effectiveHiddenIds],
     visibleIds: HOME_MODULE_REGISTRY.filter((id) => !effectiveHiddenIds.includes(id)),
     storedHiddenIds: [...hiddenHomeModules],
-    automaticLayout: !homeLayoutReadOnly && effectiveHiddenIds.length > 0,
+    automaticLayout: false,
     unavailableIds: [...unavailableHomeModules],
     readOnly: homeLayoutReadOnly,
     persisted: homeVisibilityPersisted,
@@ -3186,34 +3290,101 @@ if (homeBento) {
     return homeOrder.map((id) => (seen.has(id) ? queue.shift() : id));
   };
 
+  const dropGhost = document.createElement('div');
+  dropGhost.className = 'layout-drop-ghost';
+  dropGhost.hidden = true;
+  dropGhost.setAttribute('aria-hidden', 'true');
+  homeBento.appendChild(dropGhost);
+
+  const HOME_SIZE_DIMENSIONS = {
+    mini: { width: 2, height: 1 },
+    small: { width: 2, height: 2 },
+    medium: { width: 4, height: 2 },
+    large: { width: 4, height: 4 },
+  };
+
+  const hideDropGhost = () => {
+    dropGhost.hidden = true;
+    dropGhost.classList.remove('is-invalid');
+    dropGhost.style.removeProperty('grid-column');
+    dropGhost.style.removeProperty('grid-row');
+  };
+
+  const showDropGhost = (placement, valid) => {
+    if (!placement) {
+      hideDropGhost();
+      return;
+    }
+    dropGhost.hidden = false;
+    dropGhost.classList.toggle('is-invalid', !valid);
+    dropGhost.style.gridColumn = `${placement.column + 1} / span ${placement.width}`;
+    dropGhost.style.gridRow = `${placement.row + 1} / span ${placement.height}`;
+  };
+
+  const clampGhostPlacement = (placement) => {
+    const width = Math.min(Math.max(1, placement.width), 12);
+    const height = Math.min(Math.max(1, placement.height), 4);
+    return {
+      column: Math.min(Math.max(0, placement.column), 12 - width),
+      row: Math.min(Math.max(0, placement.row), 4 - height),
+      width,
+      height,
+    };
+  };
+
+  const applyLayoutChange = (next, reason) => {
+    homeOrder = mergeVisibleOrder(next.visibleOrder);
+    homeSizes = { ...homeSizes, ...next.sizes };
+    applyHomeLayout(next, { reason });
+    saveHomeLayout();
+  };
+
   const highlightDropCell = (clientX, clientY, sourceTile) => {
     clearDropTarget();
     const cell = pointerToHomeCell(clientX, clientY);
-    if (!cell) {
-      dragState.target = null;
-      dragState.cell = null;
+    if (!cell || !dragState) {
+      if (dragState) dragState.preview = null;
+      hideDropGhost();
       return;
     }
-    const hit = window.NotchDomain.findHomeWidgetAtCell(currentHomeLayoutFromDom().placements, cell.column, cell.row);
-    const target = hit && hit.id !== sourceTile.dataset.homeModule ? tileForModule(hit.id) : null;
-    dragState.cell = cell;
-    dragState.target = target && !target.hidden ? target : null;
-    dragState.target?.classList.add('layout-drop-target');
+    const column = cell.column - (dragState.grabColumnOffset || 0);
+    const row = cell.row - (dragState.grabRowOffset || 0);
+    const layout = currentHomeLayoutFromDom();
+    const current = layout.placements[sourceTile.dataset.homeModule];
+    const next = window.NotchDomain.moveHomeWidgetToCell(layout, sourceTile.dataset.homeModule, column, row);
+    dragState.preview = next;
+    if (next) {
+      showDropGhost(next.placements[sourceTile.dataset.homeModule], true);
+      return;
+    }
+    if (!current) {
+      hideDropGhost();
+      return;
+    }
+    showDropGhost(clampGhostPlacement({
+      column,
+      row,
+      width: current.width,
+      height: current.height,
+    }), false);
   };
 
   const beginHomeDrag = (pending) => {
-    if (!pending || dragState || homeLayoutReadOnly) return;
+    if (!pending || dragState || resizeState || isHomeLayoutFrozen()) return;
     const { tile, startX, startY, pointerId } = pending;
     tile.setPointerCapture?.(pointerId);
     homeBento.classList.add('layout-dragging');
     tile.classList.add('is-dragging');
+    const origin = pointerToHomeCell(startX, startY);
+    const placement = currentHomeLayoutFromDom().placements[tile.dataset.homeModule];
     dragState = {
       tile,
-      target: null,
-      cell: null,
       pointerId,
       startX,
       startY,
+      preview: null,
+      grabColumnOffset: origin && placement ? origin.column - placement.column : 0,
+      grabRowOffset: origin && placement ? origin.row - placement.row : 0,
     };
     pendingLongPress = null;
     if (navigator.vibrate) navigator.vibrate(18);
@@ -3223,38 +3394,118 @@ if (homeBento) {
     if (pendingLongPress) clearTimeout(pendingLongPress.timer);
     pendingLongPress = null;
     if (!dragState) return;
-    const { tile, pointerId } = dragState;
-    const cell = cancelled ? null : (dragState.cell || pointerToHomeCell(event.clientX, event.clientY));
+    const { tile, pointerId, preview } = dragState;
     if (tile.hasPointerCapture?.(pointerId)) tile.releasePointerCapture(pointerId);
     tile.classList.remove('is-dragging', 'hit-test-off');
     tile.style.removeProperty('--home-drag-x');
     tile.style.removeProperty('--home-drag-y');
     homeBento.classList.remove('layout-dragging');
     clearDropTarget();
-    if (!cancelled && cell) {
-      const next = window.NotchDomain.moveHomeWidgetToCell(
-        currentHomeLayoutFromDom(),
-        tile.dataset.homeModule,
-        cell.column,
-        cell.row
-      );
-      if (next) {
-        homeOrder = mergeVisibleOrder(next.visibleOrder);
-        homeSizes = { ...homeSizes, ...next.sizes };
-        applyHomeLayout(next, { reason: 'reorder' });
-        saveHomeLayout();
-        const label = HOME_SIZE_LABELS[homeSizes[tile.dataset.homeModule]] || '';
-        showStatusToast(label ? `板块已放到新位置，已改为${label}组件` : '板块已放到新位置，尺寸已自适应');
-      }
+    hideDropGhost();
+    const next = cancelled ? null : preview;
+    if (next) {
+      applyLayoutChange(next, 'reorder');
+      showStatusToast('板块已放到新位置');
     }
     dragState = null;
     suppressHomeClickUntil = Date.now() + 260;
   };
 
+  const resizeCursorForEdge = (edge) => ({
+    n: 'n-resize',
+    s: 's-resize',
+    e: 'e-resize',
+    w: 'w-resize',
+    ne: 'ne-resize',
+    nw: 'nw-resize',
+    se: 'nwse-resize',
+    sw: 'nesw-resize',
+  }[edge] || 'nwse-resize');
+
+  const beginHomeResize = (tile, event, edge = 'se') => {
+    if (dragState || resizeState || isHomeLayoutFrozen()) return;
+    const placement = currentHomeLayoutFromDom().placements[tile.dataset.homeModule];
+    if (!placement) return;
+    const handle = event.target.closest('[data-widget-resize]') || tile.querySelector(`[data-widget-resize-edge="${edge}"]`);
+    tile.setPointerCapture?.(event.pointerId);
+    handle?.classList.add('is-active');
+    homeBento.classList.add('layout-resizing');
+    homeBento.style.cursor = resizeCursorForEdge(edge);
+    resizeState = {
+      tile,
+      pointerId: event.pointerId,
+      start: placement,
+      edge: edge || 'se',
+      handle,
+      preview: null,
+      attempted: false,
+    };
+    pendingLongPress = null;
+  };
+
+  const highlightResize = (clientX, clientY) => {
+    if (!resizeState) return;
+    const cell = pointerToHomeCell(clientX, clientY);
+    const { tile, start, edge } = resizeState;
+    if (!cell) {
+      resizeState.preview = null;
+      hideDropGhost();
+      return;
+    }
+    resizeState.attempted = true;
+    const layout = currentHomeLayoutFromDom();
+    const next = window.NotchDomain.resizeHomeWidgetFromEdge(
+      layout,
+      tile.dataset.homeModule,
+      edge,
+      cell.column,
+      cell.row
+    );
+    resizeState.preview = next;
+    if (next) {
+      showDropGhost(next.placements[tile.dataset.homeModule], true);
+      return;
+    }
+    const ghost = window.NotchDomain.placementFromResizeEdge(start, edge, cell.column, cell.row);
+    showDropGhost(ghost ? clampGhostPlacement(ghost) : null, false);
+  };
+
+  const finishHomeResize = (event, cancelled = false) => {
+    if (!resizeState) return;
+    const { tile, pointerId, preview, attempted } = resizeState;
+    const handle = resizeState.handle || tile.querySelector(`[data-widget-resize-edge="${resizeState.edge || 'se'}"]`);
+    if (tile.hasPointerCapture?.(pointerId)) tile.releasePointerCapture(pointerId);
+    handle?.classList.remove('is-active');
+    homeBento.classList.remove('layout-resizing');
+    homeBento.style.removeProperty('cursor');
+    hideDropGhost();
+    const next = cancelled ? null : preview;
+    if (next) {
+      applyLayoutChange(next, 'size');
+      const label = HOME_SIZE_LABELS[homeSizes[tile.dataset.homeModule]] || '';
+      showStatusToast(label ? `板块已调整为${label}组件` : '板块大小已更新');
+    } else if (!cancelled && attempted) {
+      showStatusToast('这里放不下这个尺寸，先把旁边的板块移开或缩小');
+    }
+    resizeState = null;
+    suppressHomeClickUntil = Date.now() + 260;
+  };
+
+  let resizeState = null;
+
   homeBento.addEventListener('pointerdown', (event) => {
-    if (event.button !== 0 || event.isPrimary === false || homeLayoutReadOnly) return;
+    if (event.button !== 0 || event.isPrimary === false || isHomeLayoutFrozen()) return;
+    const resizeHandle = event.target.closest('[data-widget-resize]');
+    if (resizeHandle) {
+      const tile = resizeHandle.closest('[data-home-module]');
+      if (!tile || tile.hidden) return;
+      event.preventDefault();
+      beginHomeResize(tile, event, resizeHandle.dataset.widgetResizeEdge || 'se');
+      return;
+    }
     const tile = event.target.closest('[data-home-module]');
-    if (!tile || tile.hidden || event.target.closest('button, input, textarea, select, a, audio, [contenteditable]')) return;
+    // 镜子整张卡就是一个按钮：标了 data-home-drag-surface 的仍可拖动，松手未移动则照常点击。
+    if (!tile || tile.hidden || event.target.closest('input, textarea, select, a, audio, [contenteditable], button:not([data-home-drag-surface])')) return;
     const startX = event.clientX;
     const startY = event.clientY;
     pendingLongPress = {
@@ -3265,7 +3516,7 @@ if (homeBento) {
       timer: setTimeout(() => {
         if (!pendingLongPress) return;
         beginHomeDrag(pendingLongPress);
-      }, 180),
+      }, 80),
     };
   });
 
@@ -3274,30 +3525,38 @@ if (homeBento) {
     if (!sizeButton) return;
     event.preventDefault();
     event.stopPropagation();
-    if (effectiveHomeHidden(hiddenHomeModules).length > 0 || homeLayoutReadOnly) return;
+    if (isHomeLayoutFrozen()) return;
     const moduleId = sizeButton.dataset.widgetSizeCycle;
     const sequence = ['mini', 'small', 'medium', 'large'];
     const current = homeSizes[moduleId] || HOME_SIZE_DEFAULTS[moduleId];
     const requested = sequence[(sequence.indexOf(current) + 1) % sequence.length];
-    homeSizes = window.NotchDomain.normalizeHomeWidgetSizes({
-      ...homeSizes,
-      [moduleId]: requested,
-    }, HOME_SIZE_DEFAULTS, moduleId, 48);
-    const layout = resolveValidatedHomeLayout(hiddenHomeModules, homeOrder, homeSizes, { usePlacements: false });
-    if (layout) {
-      applyHomeLayout(layout, { reason: 'size' });
-      saveHomeLayout();
-      showStatusToast(`${HOME_SIZE_LABELS[homeSizes[moduleId]]}组件 · 其他模块已自适应`);
+    const dimension = HOME_SIZE_DIMENSIONS[requested] || HOME_SIZE_DIMENSIONS.small;
+    const next = window.NotchDomain.resizeHomeWidget(
+      currentHomeLayoutFromDom(),
+      moduleId,
+      dimension.width,
+      dimension.height
+    );
+    if (next) {
+      applyLayoutChange(next, 'size');
+      showStatusToast(`${HOME_SIZE_LABELS[next.sizes[moduleId] || requested]}组件`);
+    } else {
+      showStatusToast('这里放不下这个尺寸，先把旁边的板块移开或缩小');
     }
   });
 
   homeBento.addEventListener('pointermove', (event) => {
+    if (resizeState && resizeState.pointerId === event.pointerId) {
+      event.preventDefault();
+      highlightResize(event.clientX, event.clientY);
+      return;
+    }
     if (pendingLongPress && pendingLongPress.pointerId === event.pointerId) {
       const moved = Math.hypot(
         event.clientX - pendingLongPress.startX,
         event.clientY - pendingLongPress.startY
       );
-      if (moved > 6) {
+      if (moved > 3) {
         clearTimeout(pendingLongPress.timer);
         beginHomeDrag(pendingLongPress);
       } else {
@@ -3312,14 +3571,34 @@ if (homeBento) {
     highlightDropCell(event.clientX, event.clientY, tile);
   });
 
-  homeBento.addEventListener('pointerup', (event) => finishHomeDrag(event));
-  homeBento.addEventListener('pointercancel', (event) => finishHomeDrag(event, true));
+  homeBento.addEventListener('pointerup', (event) => {
+    if (resizeState) finishHomeResize(event);
+    else finishHomeDrag(event);
+  });
+  homeBento.addEventListener('pointercancel', (event) => {
+    if (resizeState) finishHomeResize(event, true);
+    else finishHomeDrag(event, true);
+  });
   homeBento.addEventListener('click', (event) => {
     if (Date.now() >= suppressHomeClickUntil) return;
     event.preventDefault();
     event.stopImmediatePropagation();
   }, true);
 }
+
+const homeLayoutLockButton = document.getElementById('home-layout-lock');
+if (homeLayoutLockButton) {
+  homeLayoutLockButton.addEventListener('click', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (homeLayoutReadOnly) {
+      showStatusToast('当前是安全布局，暂不能调整');
+      return;
+    }
+    setHomeLayoutLocked(!homeLayoutLocked);
+  });
+}
+
 
 // ============ 距离感应 Dock 悬浮 ============
 function bindDockSurface(surface, selector, maxScale = 1.14) {

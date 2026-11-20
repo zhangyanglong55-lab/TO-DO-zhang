@@ -2495,6 +2495,79 @@ textarea,
   border-color: rgba(143, 182, 255, .5);
   box-shadow: inset 0 0 0 1px rgba(143,182,255,.18), 0 14px 34px rgba(0,0,0,.3);
 }
+.home-bento > .layout-drop-ghost {
+  pointer-events: none;
+  z-index: 15;
+  border-radius: 14px;
+  border: 1.5px dashed rgba(151, 178, 255, .9);
+  background: rgba(151, 178, 255, .16);
+}
+.home-bento > .layout-drop-ghost.is-invalid {
+  border-color: rgba(255, 138, 138, .95);
+  background: rgba(255, 80, 80, .14);
+}
+.home-bento.layout-resizing { cursor: inherit; }
+.widget-resize-handle {
+  position: absolute;
+  z-index: 30;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: rgba(255, 255, 255, .62);
+  opacity: 0;
+  transition: opacity 140ms var(--ease), background 140ms var(--ease), color 140ms var(--ease);
+}
+.widget-resize-handle-n { top: 0; left: 12px; right: 12px; height: 8px; width: auto; cursor: n-resize; }
+.widget-resize-handle-s { bottom: 0; left: 12px; right: 12px; height: 8px; width: auto; cursor: s-resize; }
+.widget-resize-handle-e { top: 12px; right: 0; bottom: 12px; width: 8px; height: auto; cursor: e-resize; }
+.widget-resize-handle-w { top: 12px; left: 0; bottom: 12px; width: 8px; height: auto; cursor: w-resize; }
+.widget-resize-handle-ne { top: 0; right: 0; width: 14px; height: 14px; cursor: ne-resize; }
+.widget-resize-handle-nw { top: 0; left: 0; width: 14px; height: 14px; cursor: nw-resize; }
+.widget-resize-handle-se {
+  right: 3px;
+  bottom: 3px;
+  width: 16px;
+  height: 16px;
+  border-radius: 4px;
+  background: rgba(8, 8, 10, .55);
+  cursor: nwse-resize;
+}
+.widget-resize-handle-sw { left: 0; bottom: 0; width: 14px; height: 14px; cursor: nesw-resize; }
+.tile:hover > .widget-resize-handle,
+.tile:focus-within > .widget-resize-handle,
+.widget-resize-handle.is-active {
+  opacity: 1;
+}
+.widget-resize-handle-n:hover,
+.widget-resize-handle-s:hover,
+.widget-resize-handle-e:hover,
+.widget-resize-handle-w:hover,
+.widget-resize-handle-n.is-active,
+.widget-resize-handle-s.is-active,
+.widget-resize-handle-e.is-active,
+.widget-resize-handle-w.is-active {
+  background: rgba(255, 255, 255, .16);
+}
+.widget-resize-handle-se:hover,
+.widget-resize-handle-se.is-active,
+.widget-resize-handle:hover,
+.widget-resize-handle.is-active {
+  color: var(--text-1);
+}
+.widget-resize-handle-se:hover,
+.widget-resize-handle-se.is-active {
+  background: rgba(50, 50, 56, .88);
+}
+.widget-resize-handle svg {
+  width: 10px;
+  height: 10px;
+  display: block;
+}
+.home-bento[data-layout-locked='true'] .widget-resize-handle,
+.home-bento[data-layout-locked='true'] .widget-size-control {
+  display: none !important;
+}
 
 /* 镜子是纯图像卡片，第二层图像只在指针附近参与折射。 */
 .home-mirror {
@@ -2731,7 +2804,7 @@ textarea,
 
 /* ============ 实时录音 Strands ============ */
 .home-recorder { isolation: isolate; }
-.home-recorder > :not(.recording-strands):not(.widget-size-control) { position: relative; z-index: 2; }
+.home-recorder > :not(.recording-strands):not(.widget-size-control):not(.widget-resize-handle) { position: relative; z-index: 2; }
 .recording-strands {
   position: absolute;
   inset: 0;
@@ -3382,12 +3455,16 @@ textarea,
 .tabs.is-split .tab-split-start { margin-left: auto; }
 .topbar-mid { position:absolute; inset:4px 8px auto auto; z-index:6; }
 
-/* 模块尺寸按钮固定在右下角，避免争夺标题区。 */
+/* 尺寸切换在右上角，右下角留给拖拽缩放手柄。 */
 .widget-size-control,
 [data-widget-size='mini'] .widget-size-control {
-  top: auto;
-  right: 7px;
-  bottom: 7px;
+  top: 8px;
+  right: 8px;
+  bottom: auto;
+}
+[data-widget-size='mini'] .widget-size-control {
+  top: 4px;
+  right: 4px;
 }
 
 /* 汽水音乐：同一视觉语言的四套裁切资产，按钮始终可见。 */
@@ -3566,6 +3643,7 @@ textarea,
 .home-note[data-widget-size='mini'] .note-toolbar { min-height: 18px; }
 .home-note[data-widget-size='mini'] .note-format-actions,
 .home-note[data-widget-size='mini'] .note-save-btn,
+.home-note[data-widget-size='mini'] .note-new-btn,
 .home-note[data-widget-size='mini'] #note-edit-btn { display: none; }
 .home-note[data-widget-size='mini'] .note-body { min-height: 0; overflow: hidden; }
 .home-note[data-widget-size='mini'] .note-input { display: none !important; }
@@ -3608,7 +3686,8 @@ textarea,
   line-height: 1.42;
   padding: 2px;
 }
-.home-note[data-widget-size='mini'] .note-save-btn { display: grid; }
+.home-note[data-widget-size='mini'] .note-save-btn,
+.home-note[data-widget-size='mini'] .note-new-btn { display: grid; }
 .home-note[data-widget-size='mini'] .note-toolbar .tile-label { font-size: 10px; }
 .home-note[data-widget-size='mini'] .note-persist-actions { transform: scale(.76); transform-origin: right center; }
 .note-library { padding: 2px; }
@@ -3664,8 +3743,8 @@ textarea,
   border-radius: inherit;
   pointer-events: none;
 }
-.home-music > :not(.module-effect-canvas),
-.home-pomodoro > :not(.module-effect-canvas) {
+.home-music > :not(.module-effect-canvas):not(.widget-size-control):not(.widget-resize-handle),
+.home-pomodoro > :not(.module-effect-canvas):not(.widget-size-control):not(.widget-resize-handle) {
   position: relative;
   z-index: 2;
 }
@@ -3889,7 +3968,7 @@ textarea,
 }
 
 /* ============ 首页播放器与计时器 · 参考图精确排版 ============ */
-/* effects.js 会给直接子元素补层级；尺寸按钮必须始终脱离内容流并贴右下角。 */
+/* effects.js 会给直接子元素补层级；尺寸按钮和缩放手柄必须脱离网格，分别贴右上/右下。 */
 .home-music > .widget-size-control,
 .home-pomodoro > .widget-size-control,
 .home-music[data-widget-size] > .widget-size-control,
@@ -3900,12 +3979,37 @@ textarea,
   grid-row: auto !important;
   align-self: auto;
   justify-self: auto;
-  top: auto;
-  right: 7px;
-  bottom: 7px;
+  top: 8px;
+  right: 8px;
+  bottom: auto;
   z-index: 20;
   width: 24px;
   height: 24px;
+}
+.home-music[data-widget-size='mini'] > .widget-size-control,
+.home-pomodoro[data-widget-size='mini'] > .widget-size-control {
+  top: 4px;
+  right: 4px;
+}
+.home-music > .widget-resize-handle,
+.home-pomodoro > .widget-resize-handle,
+.home-music[data-widget-size] > .widget-resize-handle,
+.home-pomodoro[data-widget-size] > .widget-resize-handle,
+.tile > .widget-resize-handle {
+  position: absolute;
+  grid-column: auto !important;
+  grid-row: auto !important;
+  align-self: auto;
+  justify-self: auto;
+  z-index: 30;
+  pointer-events: auto;
+}
+.home-music > .widget-resize-handle-se,
+.home-pomodoro > .widget-resize-handle-se,
+.tile > .widget-resize-handle-se {
+  top: auto;
+  right: 3px;
+  bottom: 3px;
 }
 
 /* 汽水音乐：放弃封面，动态背景上只保留左下标题与右下毛玻璃控制组。 */
@@ -4947,6 +5051,59 @@ select:focus-visible {
 .music-switch[data-switchable='true']:hover svg { color: var(--text-1); }
 .music-switch:disabled { opacity: 1; }
 
+/* 待办页铺满面板：每日/每周工作占满左侧整列，列表吃掉页签、报告和输入行以外的全部高度。 */
+#tab-todo.active,
+#tab-todo {
+  display: flex !important;
+  flex-direction: column;
+  inset: 0;
+  height: auto;
+  min-height: 0;
+  align-self: stretch;
+}
+#tab-todo .sections {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
+  grid-template-rows: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 0;
+  height: auto;
+  align-self: stretch;
+  align-items: stretch;
+  align-content: stretch;
+}
+#tab-todo .work-board {
+  grid-column: 1;
+  grid-row: 1 / -1;
+}
+#tab-todo .quadrant {
+  display: flex !important;
+  flex-direction: column;
+  height: auto;
+  min-height: 0;
+  max-height: none;
+  align-self: stretch;
+  padding: 8px 10px 6px;
+}
+#tab-todo .todo-list,
+#tab-todo .work-board .todo-list {
+  flex: 1 1 0%;
+  min-height: 0;
+  max-height: none;
+  overflow: auto;
+}
+#tab-todo .add-row {
+  margin-top: 4px;
+  flex: 0 0 auto;
+}
+#tab-todo .work-board .todo-item {
+  min-height: 24px;
+  padding-top: 2px;
+  padding-bottom: 2px;
+}
+
 /* ============ P0 每日 / 每周工作页签 ============ */
 .work-tabs {
   display: flex;
@@ -4980,22 +5137,27 @@ select:focus-visible {
 .work-report {
   flex: 0 1 auto;
   min-height: 0;
-  max-height: calc(100% - 92px);
+  max-height: 36%;
   display: flex;
   flex-direction: column;
   overflow: auto;
   margin: 0 0 6px;
-  padding: 8px 10px;
+  padding: 6px 8px;
   border-radius: 8px;
   background: rgba(255, 255, 255, .04);
   color: var(--text-2);
   font-size: 11px;
   line-height: 1.45;
 }
-.work-report.is-empty {
+.work-report.is-empty,
+.work-report[hidden] {
+  display: none;
   color: var(--text-3);
-  flex: 0 0 auto;
-  max-height: none;
+  flex: 0 0 0;
+  margin: 0;
+  padding: 0;
+  min-height: 0;
+  max-height: 0;
   overflow: hidden;
 }
 .work-report-title {
@@ -5010,7 +5172,7 @@ select:focus-visible {
   word-break: break-word;
 }
 .work-board .todo-list {
-  flex: 1 1 auto;
+  flex: 1 1 0;
   min-height: 0;
   max-height: none;
 }
@@ -5030,3 +5192,131 @@ select:focus-visible {
   border-radius: 2px;
 }
 
+/* 首页布局锁定开关：放在顶栏右侧操作区。 */
+.home-layout-lock {
+  grid-area: actions;
+  justify-self: end;
+  position: relative;
+  z-index: 8;
+  width: 28px;
+  height: 28px;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, .06);
+  color: var(--text-2);
+  cursor: pointer;
+}
+.home-layout-lock svg {
+  width: 15px;
+  height: 15px;
+  display: block;
+}
+.home-layout-lock:hover {
+  color: var(--text-1);
+  background: rgba(255, 255, 255, .12);
+}
+.home-layout-lock[aria-pressed='true'] {
+  color: #fff;
+  background: rgba(143, 182, 255, .22);
+}
+
+/* 录音/录屏：任意尺寸都用流式排布，避免绝对定位把文字挤到右侧被裁切。 */
+.home-bento > .home-recorder,
+.home-bento > .home-recorder[data-widget-size],
+.home-bento > .home-recorder[data-layout-variant],
+.home-recorder,
+.home-recorder[data-widget-size='mini'] {
+  display: flex !important;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
+  gap: 4px;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  padding: 10px 10px 8px !important;
+}
+.home-recorder > .recorder-head,
+.home-bento > .home-recorder[data-layout-variant] .recorder-head,
+.home-recorder[data-widget-size='mini'] .recorder-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  min-width: 0;
+  max-width: 100%;
+  flex: 0 0 auto;
+  white-space: normal !important;
+  overflow: hidden;
+}
+.home-recorder .recorder-head > * {
+  min-width: 0;
+}
+.home-recorder .recorder-head time {
+  margin-left: 0;
+  flex: 0 0 auto;
+}
+.home-recorder #home-recording-state {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.home-recorder #home-open-recordings-folder {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.home-recorder .home-transcript,
+.home-bento > .home-recorder[data-layout-variant] .home-transcript {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  max-width: 100%;
+  overflow: hidden;
+  padding-bottom: 0;
+}
+.home-recorder .recorder-controls,
+.home-recorder[data-widget-size='mini'] .recorder-controls,
+.home-bento > .home-recorder[data-layout-variant] .recorder-controls {
+  position: static !important;
+  top: auto !important;
+  right: auto !important;
+  left: auto !important;
+  bottom: auto !important;
+  z-index: 2;
+  transform: none !important;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 6px;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  margin-top: auto;
+  flex: 0 0 auto;
+}
+.home-recorder[data-layout-variant='mini'] .home-transcript,
+.home-recorder[data-widget-size='mini'] .home-transcript {
+  display: none;
+}
+.home-recorder[data-layout-variant='mini'] #home-open-recordings-folder,
+.home-recorder[data-widget-size='mini'] #home-open-recordings-folder {
+  display: none;
+}
+.home-recorder[data-layout-variant='mini'] #home-recording-state,
+.home-recorder[data-widget-size='mini'] #home-recording-state {
+  max-width: 100%;
+}
+.home-recorder[data-layout-variant='wide'] {
+  display: flex !important;
+  flex-direction: column;
+}

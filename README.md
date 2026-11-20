@@ -27,10 +27,13 @@
 >
 > 相对上游，主要增加了这些能力：
 > - 待办 P0 改为「每日工作 / 每周工作」，可用 `work-inbox/` 自动写入当天日报、当周周报
+> - 每日/每周工作卡片铺满可用高度，尽量多展示任务和报告，底部不留空；没有日报或周报时也不再显示空状态提示
 > - 链接可通过 `link-inbox/` 自动导入并分类，不必再手动粘贴
-> - 录屏结束后自动转成 MP4 再保存；转换失败会保留原录像
+> - 录屏结束后自动转成 MP4 再保存；转换失败会保留原录像；录音/录屏缩到最小时，文字和按钮会折行留在卡片内
 > - 修复中文输入法只能盲打的问题，组合中的拼音和候选词窗口可以正常显示
-> - 首页板块可拖到目标位置后按位置自适应大小
+> - 首页板块按格子摆放：拖到哪里就停在哪里，并保持原来的大小；可从四边和四角缩放；顶栏可锁定，以免误触
+> - 镜子板块按住可拖动、轻点仍开关镜头；倒计时等板块也可以缩放
+> - 随笔记保存后会清空编辑框，并可新建下一篇
 >
 > 更完整的说明见 [CHANGELOG.md](CHANGELOG.md) 的「未发布」。本仓库目前以源码方式提供；官方安装包仍在[上游 Releases](https://github.com/xiaopu-ai/TO-DO-Panel/releases/latest)。本地运行请看下方「从源码运行」。数据默认在 `~/Library/Application Support/Dynamic Panel/`，不会随本仓库发布。
 
@@ -214,8 +217,8 @@ mv ~/Library/Application\ Support/Dynamic\ Panel/todo-inbox/.agent.tmp \
 桌面端要求 Node.js 22.12.0+：
 
 ```bash
-git clone https://github.com/xiaopu-ai/TO-DO-Panel.git
-cd TO-DO-Panel
+git clone https://github.com/zhangyanglong55-lab/TO-DO-zhang.git
+cd TO-DO-zhang
 npm install
 npm test
 npm start
