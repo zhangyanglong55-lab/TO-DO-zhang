@@ -422,6 +422,7 @@
       savedLink.url = inspected.url || savedLink.url;
       savedLink.title = inspected.title || savedLink.title || '未命名';
       savedLink.icon = inspected.icon || savedLink.icon || '';
+      if (inspected.summary && !savedLink.summary) savedLink.summary = inspected.summary;
       // 手动定向或同站点复用后锁定分组；自动分类只使用可预测的本地规则，
       // 避免模型自由命名生成多个近义分组。
       const lockedGroupId = preferredGroup?.id || Domain.preferredLinkGroupId(
@@ -3087,6 +3088,7 @@
         savedLink.url = inspected.url || savedLink.url;
         if (row.inspectTitle) savedLink.title = inspected.title || savedLink.title || '未命名';
         savedLink.icon = inspected.icon || savedLink.icon || '';
+        if (inspected.summary && !savedLink.summary) savedLink.summary = inspected.summary;
         if (!row.lockedCategory && row.inspectTitle) {
           const lockedGroupId = Domain.preferredLinkGroupId(
             linkGroups.map((group) => ({

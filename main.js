@@ -28,6 +28,10 @@ const PLATFORM_CAPABILITIES = platformPolicy.capabilities(process.platform);
 const {
   isPrivateAddress,
   extractPageTitle,
+  extractPageSummary,
+  isLinkInterstitialUrl,
+  unwrapLinkInterstitialUrl,
+  isGenericLinkTitle,
   recordingExtension,
   finalizeSavedRecording,
   normalizeWindowRows,
@@ -254,6 +258,9 @@ const RECORDING_MAX_BYTES = 1024 * 1024 * 1024;
 const LINK_FETCH_TIMEOUT_MS = 8000;
 const LINK_FETCH_MAX_BYTES = 512 * 1024;
 const LINK_FETCH_MAX_REDIRECTS = 3;
+// 使用常见浏览器 UA。自定义标识（如 DynamicPanel/0.3）会被微信公众号直接转到验证页，
+// 标题和摘要都读不到，收藏的地址还会被写成短期验证链接。
+const LINK_FETCH_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
 // 灵动岛：常驻窗口，三种形态共用一个窗口。
 //   live  = 物理刘海 + 左右「耳朵」，高度等于菜单栏，显示各 AI 工具的上下文占用
@@ -2703,7 +2710,7 @@ async function fetchFaviconDataUrl(pageUrl, html) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 3500);
   try {
-    const response = await fetch(candidate, { signal: controller.signal, redirect: 'error' });
+    const response = await fetch(candidate, { signal: controller.signal, redirect: 'error', headers: { 'User-Agent': LINK_FETCH_USER_AGENT } });
     const type = String(response.headers.get('content-type') || '').split(';', 1)[0].toLowerCase();
     if (!response.ok || !type.startsWith('image/')) return '';
     const bytes = Buffer.from(await response.arrayBuffer());
@@ -2763,8 +2770,27 @@ async function enrichLinkMetadata(url, title) {
 }
 
 async function inspectLink(rawUrl) {
-  let current = await validatePublicHttpUrl(rawUrl);
+  const unwrapped = unwrapLinkInterstitialUrl(rawUrl);
+  let current = await validatePublicHttpUrl(unwrapped || rawUrl);
   if (!current) return { ok: false, error: 'invalid_or_private_url' };
+  const requestedUrl = current.toString();
+
+  const finishInspected = async ({ url, title, html, category, warning }) => {
+    const finalUrl = isLinkInterstitialUrl(url) ? requestedUrl : url;
+    const summary = extractPageSummary(html || '');
+    const safeTitle = isGenericLinkTitle(title, finalUrl) ? '未命名' : title;
+    const icon = await fetchFaviconDataUrl(finalUrl, html || '');
+    return {
+      ok: true,
+      url: finalUrl,
+      title: safeTitle || '未命名',
+      category: category || '',
+      summary,
+      icon,
+      ...(warning ? { warning } : {}),
+    };
+  };
+
   for (let redirectCount = 0; redirectCount <= LINK_FETCH_MAX_REDIRECTS; redirectCount++) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), LINK_FETCH_TIMEOUT_MS);
@@ -2775,21 +2801,17 @@ async function inspectLink(rawUrl) {
         signal: controller.signal,
         headers: {
           Accept: 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.2',
-          'User-Agent': 'DynamicPanel/0.3 (+local bookmark metadata)',
+          'User-Agent': LINK_FETCH_USER_AGENT,
         },
       });
     } catch (error) {
       clearTimeout(timeout);
       // URL 已经过公网与协议校验；正文不可读不应阻止收藏，仍尝试抓站点根图标。
-      const icon = await fetchFaviconDataUrl(current.toString(), '');
-      return {
-        ok: true,
+      return finishInspected({
         url: current.toString(),
         title: '未命名',
-        category: '',
-        icon,
         warning: error && error.name === 'AbortError' ? 'timeout' : 'fetch_failed',
-      };
+      });
     }
     clearTimeout(timeout);
 
@@ -2798,7 +2820,17 @@ async function inspectLink(rawUrl) {
       if (!location || redirectCount >= LINK_FETCH_MAX_REDIRECTS) {
         return { ok: false, error: 'too_many_redirects' };
       }
-      current = await validatePublicHttpUrl(new URL(location, current).toString());
+      const resolved = new URL(location, current).toString();
+      const nextTarget = unwrapLinkInterstitialUrl(resolved) || resolved;
+      if (isLinkInterstitialUrl(resolved) && !unwrapLinkInterstitialUrl(resolved)) {
+        // 站点把文章跳到验证页时，保留原文章地址，不要把短期验证链接写进收藏。
+        return finishInspected({
+          url: current.toString(),
+          title: '未命名',
+          warning: 'verification_required',
+        });
+      }
+      current = await validatePublicHttpUrl(nextTarget);
       if (!current) return { ok: false, error: 'unsafe_redirect' };
       continue;
     }
@@ -2806,19 +2838,22 @@ async function inspectLink(rawUrl) {
     const contentType = String(response.headers.get('content-type') || '').toLowerCase();
     const fallback = current.hostname.replace(/^www\./, '');
     if (!response.ok || (!contentType.includes('text/html') && !contentType.includes('xhtml'))) {
-      const [smart, icon] = await Promise.all([
-        enrichLinkMetadata(current.toString(), fallback),
-        fetchFaviconDataUrl(current.toString(), ''),
-      ]);
-      return { ok: true, url: current.toString(), title: smart.title || '未命名', category: smart.category, icon };
+      const smart = await enrichLinkMetadata(current.toString(), fallback);
+      return finishInspected({
+        url: current.toString(),
+        title: smart.title || '未命名',
+        category: smart.category,
+      });
     }
     const html = await readResponseText(response);
     const pageTitle = extractPageTitle(html, fallback);
-    const [smart, icon] = await Promise.all([
-      enrichLinkMetadata(current.toString(), pageTitle),
-      fetchFaviconDataUrl(current.toString(), html),
-    ]);
-    return { ok: true, url: current.toString(), title: smart.title, category: smart.category, icon };
+    const smart = await enrichLinkMetadata(current.toString(), pageTitle);
+    return finishInspected({
+      url: current.toString(),
+      title: smart.title || pageTitle,
+      html,
+      category: smart.category,
+    });
   }
   return { ok: false, error: 'too_many_redirects' };
 }

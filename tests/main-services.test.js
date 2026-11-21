@@ -4,6 +4,10 @@ const assert = require('node:assert/strict');
 const {
   isPrivateAddress,
   extractPageTitle,
+  extractPageSummary,
+  isLinkInterstitialUrl,
+  unwrapLinkInterstitialUrl,
+  isGenericLinkTitle,
   extractFaviconHref,
   recordingExtension,
   shouldTranscodeRecordingToMp4,
@@ -188,6 +192,36 @@ test('extractPageTitle prefers og:title and decodes HTML entities', () => {
   assert.equal(extractPageTitle(html, 'example.com'), 'OpenAI & Friends');
   assert.equal(extractPageTitle('<title>  Docs &mdash; Home  </title>', 'example.com'), 'Docs — Home');
   assert.equal(extractPageTitle('<html></html>', 'example.com'), 'example.com');
+});
+
+test('extractPageTitle reads WeChat-style empty title plus og:title', () => {
+  const html = [
+    '<html><head><title></title>',
+    '<meta property="og:title" content="收藏 | 一文说清医疗大模型评测集、榜单及评测机构" />',
+    '<meta property="og:description" content="评测集是考卷、活榜是成绩单、评测机构是考官。" />',
+    '</head></html>',
+  ].join('');
+  assert.equal(extractPageTitle(html, 'mp.weixin.qq.com'), '收藏 | 一文说清医疗大模型评测集、榜单及评测机构');
+  assert.equal(extractPageSummary(html), '评测集是考卷、活榜是成绩单、评测机构是考官。');
+});
+
+test('extractPageSummary falls back to the description meta tag', () => {
+  const html = '<html><head><title>iconfont-阿里巴巴矢量图标库</title><meta name="description" content="iconfont-国内功能很强大且图标内容很丰富的矢量图标库" /></head></html>';
+  assert.equal(extractPageTitle(html, 'iconfont.cn'), 'iconfont-阿里巴巴矢量图标库');
+  assert.equal(extractPageSummary(html), 'iconfont-国内功能很强大且图标内容很丰富的矢量图标库');
+  assert.equal(extractPageSummary('<html></html>'), '');
+});
+
+test('WeChat captcha URLs unwrap to the original article and stay marked as interstitials', () => {
+  const article = 'https://mp.weixin.qq.com/s/dXjHdUDDWIh0FRutiOCfRA';
+  const captcha = `https://mp.weixin.qq.com/mp/wappoc_appmsgcaptcha?poc_token=abc&target_url=${encodeURIComponent(article)}`;
+  assert.equal(isLinkInterstitialUrl(captcha), true);
+  assert.equal(isLinkInterstitialUrl(article), false);
+  assert.equal(unwrapLinkInterstitialUrl(captcha), article);
+  assert.equal(unwrapLinkInterstitialUrl(article), '');
+  assert.equal(unwrapLinkInterstitialUrl('https://evil.example/x?target_url=' + encodeURIComponent(article)), '');
+  assert.equal(isGenericLinkTitle('mp.weixin.qq.com', article), true);
+  assert.equal(isGenericLinkTitle('收藏 | 一文说清医疗大模型评测集、榜单及评测机构', article), false);
 });
 
 test('favicon and smart material metadata are normalized safely', () => {

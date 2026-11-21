@@ -37,13 +37,20 @@
     );
   }
 
+  function hasUsableHttpHostname(hostname) {
+    const host = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
+    if (!host) return false;
+    // 允许域名和 IP；拒绝 edsfjas 这种没有点号的裸主机名，避免被存成无效收藏。
+    return host.includes('.') || host.includes(':');
+  }
+
   function normalizeHttpUrl(value) {
     const input = String(value || '').trim();
     if (!input) return null;
     const candidate = /^[a-z][a-z\d+.-]*:/i.test(input) ? input : `https://${input}`;
     try {
       const url = new URL(candidate);
-      if (!['http:', 'https:'].includes(url.protocol) || isLocalHostname(url.hostname)) return null;
+      if (!['http:', 'https:'].includes(url.protocol) || isLocalHostname(url.hostname) || !hasUsableHttpHostname(url.hostname)) return null;
       url.username = '';
       url.password = '';
       return url.toString();

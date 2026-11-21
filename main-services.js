@@ -76,13 +76,6 @@ function extractMetaContent(html, key) {
   return '';
 }
 
-function cleanTitle(value) {
-  return decodeHtmlEntities(String(value || '').replace(/<[^>]+>/g, ' '))
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 160);
-}
-
 function createForegroundMediaPermissionCoordinator(defaults = {}) {
   let activeRequests = 0;
   let layerOwner = null;
@@ -137,10 +130,70 @@ function createForegroundMediaPermissionCoordinator(defaults = {}) {
   };
 }
 
+function cleanText(value, limit = 160) {
+  return decodeHtmlEntities(String(value || '').replace(/<[^>]+>/g, ' '))
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, limit);
+}
+
+function cleanTitle(value) {
+  return cleanText(value, 160);
+}
+
 function extractPageTitle(html, fallback) {
-  const ogTitle = extractMetaContent(html, 'og:title');
+  const ogTitle = extractMetaContent(html, 'og:title') || extractMetaContent(html, 'twitter:title');
   const titleMatch = String(html || '').match(/<title\b[^>]*>([\s\S]*?)<\/title>/i);
   return cleanTitle(ogTitle || (titleMatch && titleMatch[1]) || fallback) || String(fallback || '未命名链接');
+}
+
+function extractPageSummary(html) {
+  const raw = extractMetaContent(html, 'og:description')
+    || extractMetaContent(html, 'twitter:description')
+    || extractMetaContent(html, 'description');
+  return cleanText(raw, 240);
+}
+
+function isWeixinHost(hostname) {
+  const host = String(hostname || '').toLowerCase();
+  return host === 'mp.weixin.qq.com' || host.endsWith('.weixin.qq.com');
+}
+
+function isLinkInterstitialUrl(value) {
+  try {
+    const url = new URL(String(value || ''));
+    if (!isWeixinHost(url.hostname)) return false;
+    return /wappoc_appmsgcaptcha|wapverify|secitptpage|verifyticket|antispam/i.test(url.pathname);
+  } catch (error) {
+    return false;
+  }
+}
+
+function unwrapLinkInterstitialUrl(value) {
+  try {
+    const url = new URL(String(value || ''));
+    if (!isLinkInterstitialUrl(url)) return '';
+    const target = url.searchParams.get('target_url');
+    if (!target) return '';
+    const next = new URL(target);
+    if (!['http:', 'https:'].includes(next.protocol) || !isWeixinHost(next.hostname) || isLinkInterstitialUrl(next)) {
+      return '';
+    }
+    return next.toString();
+  } catch (error) {
+    return '';
+  }
+}
+
+function isGenericLinkTitle(title, url) {
+  const cleaned = cleanTitle(title);
+  if (!cleaned || cleaned === '未命名' || cleaned === '未命名链接') return true;
+  try {
+    const host = new URL(String(url || '')).hostname.toLowerCase().replace(/^www\./, '');
+    return Boolean(host) && cleaned.toLowerCase() === host;
+  } catch (error) {
+    return false;
+  }
 }
 
 function extractFaviconHref(html) {
@@ -817,6 +870,10 @@ module.exports = {
   isPrivateAddress,
   decodeHtmlEntities,
   extractPageTitle,
+  extractPageSummary,
+  isLinkInterstitialUrl,
+  unwrapLinkInterstitialUrl,
+  isGenericLinkTitle,
   extractFaviconHref,
   recordingExtension,
   shouldTranscodeRecordingToMp4,

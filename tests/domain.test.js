@@ -148,6 +148,9 @@ test('normalizeHttpUrl rejects non-web and local URLs', () => {
   assert.equal(normalizeHttpUrl('file:///tmp/a'), null);
   assert.equal(normalizeHttpUrl('http://localhost:3000'), null);
   assert.equal(normalizeHttpUrl('http://127.0.0.1/private'), null);
+  assert.equal(normalizeHttpUrl('edsfjas'), null);
+  assert.equal(normalizeHttpUrl('https://edsfjas/'), null);
+  assert.equal(normalizeHttpUrl('https://www.iconfont.cn/'), 'https://www.iconfont.cn/');
 });
 
 test('classifyLink maps familiar services and falls back to 其他', () => {
